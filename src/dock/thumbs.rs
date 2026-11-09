@@ -10,13 +10,14 @@
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{
     DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_VISIBLE,
-    DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties, HTHUMBNAIL,
+    DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
 };
 
-/// The thumbnails currently registered to one destination window.
+/// The thumbnails currently registered to one destination window: source
+/// window handles paired with the thumbnail handles DWM issued for them.
 #[derive(Default)]
 pub struct Thumbs {
-    live: Vec<(isize, HTHUMBNAIL)>,
+    live: Vec<(isize, isize)>,
 }
 
 impl Thumbs {
@@ -55,10 +56,8 @@ impl Thumbs {
                 },
                 None => {
                     let registered = unsafe {
-                        let mut thumb = HTHUMBNAIL::default();
-                        DwmRegisterThumbnail(dest, HWND(source as _), &mut thumb).and_then(|()| {
-                            DwmUpdateThumbnailProperties(thumb, &props).map(|()| thumb)
-                        })
+                        DwmRegisterThumbnail(dest, HWND(source as _))
+                            .and_then(|thumb| DwmUpdateThumbnailProperties(thumb, &props).map(|()| thumb))
                     };
                     if let Ok(thumb) = registered {
                         self.live.push((source, thumb));
