@@ -4,6 +4,10 @@ User-facing changes in each release. Each release on GitHub lists these notes an
 
 ## Unreleased
 
+### New
+
+- **Preview an app's windows.** Hovering an app in the dock shows a live preview of each of its windows over the window's title, instead of titles alone. Click a preview to switch to that window, or middle-click to close it. With `window_list = "always"`, previews appear for single-window apps too.
+
 ## 0.6.1 - 2026-11-09
 
 ### Fixes
