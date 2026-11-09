@@ -284,7 +284,9 @@ impl Renderer {
                     // thumbnail covers it whenever one exists.
                     unsafe {
                         target.brush.SetColor(&palette.tile);
-                        target.rt.FillRectangle(&rect(left, thumb_top, right, thumb_bottom), &target.brush);
+                        target
+                            .rt
+                            .FillRectangle(&rect(left, thumb_top, right, thumb_bottom), &target.brush);
                         target.brush.SetColor(&palette.text);
                     }
                     let line = rect(
