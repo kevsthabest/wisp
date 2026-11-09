@@ -11,6 +11,8 @@ pub mod space;
 
 #[path = "dock/status.rs"]
 mod status;
+#[path = "dock/thumbs.rs"]
+mod thumbs;
 #[path = "dock/tray.rs"]
 mod tray;
 
@@ -161,6 +163,8 @@ struct State {
     windows_rows: Vec<String>,
     windows_targets: Vec<isize>,
     windows_hover: Option<usize>,
+    /// Live previews of the listed windows, drawn by DWM over the list.
+    windows_thumbs: thumbs::Thumbs,
     /// The last click on a notification icon, to tell double clicks.
     tray_click: Option<(tray_host::Key, Instant)>,
     /// The demo's flyout and its hovered icon, applied as icons arrive.
@@ -245,6 +249,7 @@ impl Dock {
             windows_rows: Vec::new(),
             windows_targets: Vec::new(),
             windows_hover: None,
+            windows_thumbs: thumbs::Thumbs::new(),
             tray_click: None,
             held_flyout: None,
         }));
@@ -1421,6 +1426,7 @@ impl State {
         self.windows_hover = None;
         self.windows_rows.clear();
         self.windows_targets.clear();
+        self.windows_thumbs.clear();
         unsafe {
             let _ = KillTimer(Some(self.hwnd), WINDOWS_TIMER);
             let _ = KillTimer(Some(self.hwnd), WINDOWS_HIDE_TIMER);
@@ -1516,7 +1522,7 @@ impl State {
         let anchor = self.item_rect(slot);
         let gap = (6.0 * scale).round() as i32;
         let available = anchor.top - gap - (info.rcWork.top + gap);
-        let capacity = logic::window_list_rows(available, scale, logic::LIST_PAD.1);
+        let capacity = logic::window_list_rows(available, scale, logic::LIST_PAD.1, logic::LIST_CARD_H);
         if capacity == 0 {
             self.hide_windows();
             return;
@@ -1554,16 +1560,33 @@ impl State {
             );
             let _ = InvalidateRect(Some(self.windows), None, false);
         }
+        // DWM draws the previews itself, into the rects the renderer lays
+        // out; sync them only once the popup sits at its final size.
+        let wanted: Vec<(isize, RECT)> = self
+            .windows_targets
+            .iter()
+            .enumerate()
+            .map(|(index, &target)| {
+                let (left, top, right, bottom) = logic::list_thumb_rect(index);
+                (
+                    target,
+                    RECT {
+                        left: (left * scale).round() as i32,
+                        top: (top * scale).round() as i32,
+                        right: (right * scale).round() as i32,
+                        bottom: (bottom * scale).round() as i32,
+                    },
+                )
+            })
+            .collect();
+        self.windows_thumbs.sync(self.windows, &wanted);
     }
 
     /// The row of the window list under a popup pointer position.
     fn windows_hit(&self, lp: LPARAM) -> Option<usize> {
         let scale = self.dpi as f32 / 96.0;
         let y = ((lp.0 >> 16) as i16) as f32 / scale;
-        let row = (y - logic::LIST_PAD.1) / logic::LIST_ROW;
-        (row >= 0.0)
-            .then_some(row as usize)
-            .filter(|&row| row < self.windows_targets.len())
+        logic::list_row_at(y, self.windows_targets.len())
     }
 
     fn hide_tip(&mut self) {
@@ -2291,11 +2314,18 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         palette,
                         dpi,
                         windows_rows,
+                        windows_targets,
                         windows_hover,
                         ..
                     } = &mut *s;
-                    if let Err(error) = windows_renderer.draw_windows(hwnd, *dpi, palette, windows_rows, *windows_hover)
-                    {
+                    if let Err(error) = windows_renderer.draw_windows(
+                        hwnd,
+                        *dpi,
+                        palette,
+                        windows_rows,
+                        *windows_hover,
+                        windows_targets.len(),
+                    ) {
                         eprintln!("Dock window list: {error}");
                     }
                     let _ = EndPaint(hwnd, &paint);

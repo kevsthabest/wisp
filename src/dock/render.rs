@@ -245,7 +245,12 @@ impl Renderer {
         }
     }
 
-    /// Draws an app's windows as a list, highlighting the row under the pointer.
+    /// Draws an app's windows as preview cards, highlighting the card under
+    /// the pointer. The previews themselves are DWM thumbnails composited
+    /// over the areas laid out here; this paints each card, a stand-in tile
+    /// beneath its preview, and the title under it. A row past `previews`
+    /// has no window behind it — the "+N more" overflow line — and is drawn
+    /// as plain text in its card.
     pub fn draw_windows(
         &mut self,
         hwnd: HWND,
@@ -253,58 +258,82 @@ impl Renderer {
         palette: &Palette,
         rows: &[String],
         hover: Option<usize>,
+        previews: usize,
     ) -> Result<()> {
         self.paint(hwnd, dpi, palette, |target, formats| {
             background(target, palette, 1.0);
             let size = unsafe { target.rt.GetSize() };
             for (index, row) in rows.iter().enumerate() {
-                let top = logic::LIST_PAD.1 + index as f32 * logic::LIST_ROW;
-                let line = rect(
+                let top = logic::list_card_top(index);
+                let card = rect(
                     logic::LIST_PAD.0,
                     top,
                     size.width - logic::LIST_PAD.0,
-                    top + logic::LIST_ROW,
+                    top + logic::LIST_CARD_H,
                 );
                 if hover == Some(index) {
                     unsafe {
                         target.brush.SetColor(&palette.row_selected);
-                        target.rt.FillRoundedRectangle(&rounded(line, 4.0), &target.brush);
+                        target.rt.FillRoundedRectangle(&rounded(card, 6.0), &target.brush);
                     }
                 }
-                unsafe { target.brush.SetColor(&palette.text) };
                 let wide: Vec<u16> = row.encode_utf16().collect();
-                unsafe {
-                    target.rt.DrawText(
-                        &wide,
-                        &formats.row,
-                        &line,
-                        &target.brush,
-                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                        DWRITE_MEASURING_MODE_NATURAL,
+                let (left, thumb_top, right, thumb_bottom) = logic::list_thumb_rect(index);
+                if index < previews {
+                    // A stand-in for a window DWM cannot preview; the live
+                    // thumbnail covers it whenever one exists.
+                    unsafe {
+                        target.brush.SetColor(&palette.tile);
+                        target.rt.FillRectangle(&rect(left, thumb_top, right, thumb_bottom), &target.brush);
+                        target.brush.SetColor(&palette.text);
+                    }
+                    let line = rect(
+                        left,
+                        thumb_bottom + logic::LIST_CARD_GAP,
+                        right,
+                        thumb_bottom + logic::LIST_CARD_GAP + logic::LIST_TITLE_H,
                     );
+                    unsafe {
+                        target.rt.DrawText(
+                            &wide,
+                            &formats.row,
+                            &line,
+                            &target.brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    }
+                } else {
+                    let mid = top + logic::LIST_CARD_H / 2.0;
+                    let line = rect(
+                        left,
+                        mid - logic::LIST_TITLE_H / 2.0,
+                        right,
+                        mid + logic::LIST_TITLE_H / 2.0,
+                    );
+                    unsafe {
+                        target.brush.SetColor(&palette.subtext);
+                        target.rt.DrawText(
+                            &wide,
+                            &formats.row,
+                            &line,
+                            &target.brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    }
                 }
             }
             Ok(())
         })
     }
 
-    /// The window list's window size in DIPs.
+    /// The window list's window size in DIPs: fixed by the preview cards,
+    /// however long the titles are — they clip at the card's edge.
     pub fn measure_windows(&self, rows: &[String]) -> Result<(f32, f32)> {
-        let mut width = 0.0f32;
-        for row in rows {
-            let wide: Vec<u16> = row.encode_utf16().collect();
-            unsafe {
-                let layout = self
-                    .dw
-                    .CreateTextLayout(&wide, &self.formats.row, logic::LIST_TEXT_MAX, 1000.0)?;
-                let mut metrics = DWRITE_TEXT_METRICS::default();
-                layout.GetMetrics(&mut metrics)?;
-                width = width.max(metrics.widthIncludingTrailingWhitespace);
-            }
-        }
         Ok((
-            width.ceil().min(logic::LIST_TEXT_MAX) + 2.0 * logic::LIST_PAD.0,
-            rows.len() as f32 * logic::LIST_ROW + 2.0 * logic::LIST_PAD.1,
+            logic::list_width(),
+            rows.len() as f32 * logic::LIST_CARD_H + 2.0 * logic::LIST_PAD.1,
         ))
     }
 

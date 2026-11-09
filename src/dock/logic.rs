@@ -80,18 +80,54 @@ pub const TRAY_W: f32 = 32.0;
 pub const VOLUME_W: f32 = 46.0;
 pub const BATTERY_W: f32 = 50.0;
 pub const CLOCK_W: f32 = 88.0;
-/// The window list above an app icon: its padding, one row per window, and
-/// the widest a row may be before it is clipped, in DIPs.
+/// The window list above an app icon, in DIPs: the popup's padding, and the
+/// preview card each window gets. A card is a live preview over the window's
+/// title; the preview area keeps a 16:9 shape and DWM letterboxes the actual
+/// window inside it, whatever shape the window is.
 pub const LIST_PAD: (f32, f32) = (7.0, 3.0);
-pub const LIST_ROW: f32 = 22.0;
-pub const LIST_TEXT_MAX: f32 = 280.0;
+pub const LIST_THUMB_W: f32 = 216.0;
+pub const LIST_THUMB_H: f32 = 122.0;
+/// Inset between a card's edge and its preview and title.
+pub const LIST_CARD_IN: f32 = 6.0;
+/// Space between a card's preview and its title.
+pub const LIST_CARD_GAP: f32 = 4.0;
+/// The title line under a card's preview.
+pub const LIST_TITLE_H: f32 = 18.0;
+/// One window's whole card: inset, preview, gap, title, inset.
+pub const LIST_CARD_H: f32 = LIST_CARD_IN + LIST_THUMB_H + LIST_CARD_GAP + LIST_TITLE_H + LIST_CARD_IN;
 
-/// Whole rows that fit in a physical-pixel height, including both DIP paddings.
-pub fn window_list_rows(available: i32, scale: f32, padding: f32) -> usize {
+/// The popup's width: one preview, its card insets, and the popup padding.
+pub fn list_width() -> f32 {
+    LIST_THUMB_W + 2.0 * LIST_CARD_IN + 2.0 * LIST_PAD.0
+}
+
+/// The top of a window's card, in popup DIPs.
+pub fn list_card_top(index: usize) -> f32 {
+    LIST_PAD.1 + index as f32 * LIST_CARD_H
+}
+
+/// A window's preview area, in popup DIPs: (left, top, right, bottom).
+/// DWM draws the live window into this rect, so the renderer, the hit test
+/// and the thumbnail placement all take it from here and cannot drift apart.
+pub fn list_thumb_rect(index: usize) -> (f32, f32, f32, f32) {
+    let left = LIST_PAD.0 + LIST_CARD_IN;
+    let top = list_card_top(index) + LIST_CARD_IN;
+    (left, top, left + LIST_THUMB_W, top + LIST_THUMB_H)
+}
+
+/// The card under a popup y coordinate, in DIPs, among `count` cards.
+pub fn list_row_at(y: f32, count: usize) -> Option<usize> {
+    let row = ((y - LIST_PAD.1) / LIST_CARD_H).floor();
+    (row >= 0.0 && (row as usize) < count).then_some(row as usize)
+}
+
+/// Whole rows of `row_height` that fit in a physical-pixel height,
+/// including both DIP paddings.
+pub fn window_list_rows(available: i32, scale: f32, padding: f32, row_height: f32) -> usize {
     let available = available.max(0) as f32;
-    let rows = ((available / scale - 2.0 * padding).max(0.0) / LIST_ROW).floor() as usize;
+    let rows = ((available / scale - 2.0 * padding).max(0.0) / row_height).floor() as usize;
     // Match the popup's rounding to whole physical pixels at fractional scales.
-    if rows > 0 && ((rows as f32 * LIST_ROW + 2.0 * padding) * scale).ceil() > available {
+    if rows > 0 && ((rows as f32 * row_height + 2.0 * padding) * scale).ceil() > available {
         rows - 1
     } else {
         rows
@@ -305,18 +341,43 @@ mod tests {
     fn window_list_fits_whole_rows_with_padding_at_each_scale() {
         for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
             for padding in [0.0, LIST_PAD.1, 8.0] {
-                assert_eq!(window_list_rows(-10, scale, padding), 0);
-                assert_eq!(window_list_rows(0, scale, padding), 0);
+                assert_eq!(window_list_rows(-10, scale, padding, LIST_CARD_H), 0);
+                assert_eq!(window_list_rows(0, scale, padding, LIST_CARD_H), 0);
                 let padding_height = (2.0 * padding * scale).ceil() as i32;
-                assert_eq!(window_list_rows(padding_height, scale, padding), 0);
+                assert_eq!(window_list_rows(padding_height, scale, padding, LIST_CARD_H), 0);
                 for rows in [1, 2, 10, 100] {
-                    let height = ((rows as f32 * LIST_ROW + 2.0 * padding) * scale).ceil() as i32;
-                    assert_eq!(window_list_rows(height, scale, padding), rows);
-                    assert_eq!(window_list_rows(height - 1, scale, padding), rows - 1);
-                    assert_eq!(window_list_rows(height + 1, scale, padding), rows);
+                    let height = ((rows as f32 * LIST_CARD_H + 2.0 * padding) * scale).ceil() as i32;
+                    assert_eq!(window_list_rows(height, scale, padding, LIST_CARD_H), rows);
+                    assert_eq!(window_list_rows(height - 1, scale, padding, LIST_CARD_H), rows - 1);
+                    assert_eq!(window_list_rows(height + 1, scale, padding, LIST_CARD_H), rows);
                 }
             }
         }
+    }
+
+    #[test]
+    fn window_list_cards_stack_from_the_top_padding() {
+        assert_eq!(list_card_top(0), LIST_PAD.1);
+        assert_eq!(list_card_top(2), LIST_PAD.1 + 2.0 * LIST_CARD_H);
+        let (left, top, right, bottom) = list_thumb_rect(1);
+        assert_eq!(left, LIST_PAD.0 + LIST_CARD_IN);
+        assert_eq!(top, list_card_top(1) + LIST_CARD_IN);
+        assert_eq!(right - left, LIST_THUMB_W);
+        assert_eq!(bottom - top, LIST_THUMB_H);
+        // The title fits between a card's preview and the next card.
+        assert!(bottom + LIST_CARD_GAP + LIST_TITLE_H <= list_card_top(2));
+        // The popup is exactly as wide as a card plus its padding.
+        assert_eq!(list_width(), right + LIST_CARD_IN + LIST_PAD.0);
+    }
+
+    #[test]
+    fn window_list_hit_follows_the_cards() {
+        assert_eq!(list_row_at(LIST_PAD.1 - 0.5, 3), None);
+        assert_eq!(list_row_at(LIST_PAD.1, 3), Some(0));
+        assert_eq!(list_row_at(LIST_PAD.1 + LIST_CARD_H - 0.5, 3), Some(0));
+        assert_eq!(list_row_at(LIST_PAD.1 + LIST_CARD_H, 3), Some(1));
+        assert_eq!(list_row_at(LIST_PAD.1 + 3.0 * LIST_CARD_H, 3), None);
+        assert_eq!(list_row_at(LIST_PAD.1, 0), None);
     }
 
     #[test]
