@@ -174,12 +174,14 @@ fn session() -> std::io::Result<()> {
         serde_json::json!({ "topics": ["tray", "theme", "launcher"] }),
     );
     CONNECTED.store(true, Ordering::SeqCst);
+    eprintln!("[coquille] pipe session up (hello + subscribe sent)");
 
     let reader = BufReader::new(file);
     for line in reader.lines() {
         let line = line?;
         handle_line(&line);
     }
+    eprintln!("[coquille] pipe session ended");
     Ok(())
 }
 
@@ -194,6 +196,12 @@ fn handle_line(line: &str) {
     let payload = event.get("payload").cloned().unwrap_or(serde_json::Value::Null);
     match topic {
         "tray" => {
+            let icons = payload
+                .get("icons")
+                .and_then(|i| i.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            eprintln!("[coquille] tray event: {icons} icon(s)");
             *LAST_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(payload.clone());
             apply_snapshot(&payload);
         }
@@ -219,6 +227,12 @@ fn handle_line(line: &str) {
                 *monitor_slot = monitor;
                 changed
             };
+            eprintln!(
+                "[coquille] theme event: edge={:?} monitor={:?} tokens={}",
+                edge(),
+                target_monitor(),
+                payload.get("accent").is_some()
+            );
             if let Some(tokens) = parse_tokens(&payload) {
                 *TOKENS.lock().unwrap_or_else(|e| e.into_inner()) = Some(tokens);
                 post_launcher(WM_APP_THEME);
