@@ -559,11 +559,25 @@ impl Dock {
     /// Lets the dock auto-hide: it appears when the pointer reaches the
     /// bottom edge of a screen.
     pub fn show(&mut self) {
+        self.present(false);
+    }
+
+    /// Shows the dock and keeps it on screen. A standalone shell
+    /// session has no taskbar-peek sequence to reveal the dock and
+    /// no Explorer bar to fall back on: the bar is the session's
+    /// furniture, present from logon, so the config's auto-hide
+    /// default (written for life alongside Explorer) does not
+    /// apply until the shell says otherwise.
+    pub fn show_revealed(&mut self) {
+        self.present(true);
+    }
+
+    fn present(&mut self, revealed: bool) {
         self.state.borrow_mut().suspended = false;
         let mut s = self.state.borrow_mut();
         s.visible = true;
         // A dock that stays visible comes back in place, without sliding.
-        s.revealed = !s.autohide;
+        s.revealed = revealed || !s.autohide;
         s.surface_rect = None;
         s.stop_slide();
         unsafe {

@@ -638,9 +638,26 @@ impl Launcher {
             };
             dock.set_tray(tray_on);
             dock.set_autohide(self.config.dock_autohide);
-            if self.visible { dock.hide() } else { dock.show() }
+            if self.visible {
+                dock.hide()
+            } else {
+                Self::present_dock(dock)
+            }
         }
         self.sync_reserve();
+    }
+
+    /// Presents the dock when the launcher closes or the shell
+    /// syncs. Bridge mode honours the config's auto-hide; a
+    /// standalone shell keeps its bar on screen — there is no
+    /// taskbar-peek sequence to reveal it, and the auto-hide
+    /// default was written for life alongside Explorer.
+    fn present_dock(dock: &mut Dock) {
+        if crate::backend::is_standalone() {
+            dock.show_revealed();
+        } else {
+            dock.show();
+        }
     }
 
     /// Keeps maximized windows above a dock that stays visible while the
@@ -939,7 +956,7 @@ impl Launcher {
         if let Some(dock) = &mut self.dock
             && !self.taskbar.as_ref().is_some_and(TaskbarHider::is_peeking)
         {
-            dock.show();
+            Self::present_dock(dock);
         }
     }
 
