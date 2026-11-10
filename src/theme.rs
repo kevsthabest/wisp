@@ -12,6 +12,7 @@ fn rgba(hex: u32, a: f32) -> D2D1_COLOR_F {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct Palette {
     pub background: D2D1_COLOR_F,
     pub text: D2D1_COLOR_F,
@@ -27,7 +28,73 @@ pub struct Palette {
     pub background_solid: D2D1_COLOR_F,
 }
 
+/// The shell's semantic tokens, as published over the Coquille
+/// component pipe (`set_theme`): hex strings in `#RRGGBB` /
+/// `#RRGGBBAA` form, straight from the active pack.
+#[derive(Debug, Clone)]
+pub struct TokenColors {
+    pub surface: String,
+    pub raised: String,
+    pub foreground: String,
+    pub muted: String,
+    pub accent: String,
+}
+
+fn token_color(hex: &str, fallback: D2D1_COLOR_F) -> D2D1_COLOR_F {
+    let digits = hex.strip_prefix('#').unwrap_or(hex);
+    let parse = |s: &str| u8::from_str_radix(s, 16).ok();
+    if digits.len() != 6 && digits.len() != 8 {
+        return fallback;
+    }
+    let (Some(r), Some(g), Some(b)) = (parse(&digits[0..2]), parse(&digits[2..4]), parse(&digits[4..6])) else {
+        return fallback;
+    };
+    let a = if digits.len() == 8 {
+        parse(&digits[6..8]).map(|v| v as f32 / 255.0).unwrap_or(1.0)
+    } else {
+        1.0
+    };
+    D2D1_COLOR_F {
+        r: r as f32 / 255.0,
+        g: g as f32 / 255.0,
+        b: b as f32 / 255.0,
+        a,
+    }
+}
+
 impl Palette {
+    /// The standalone-shell palette: the active Coquille pack's
+    /// tokens mapped onto the same slots the built-in tables fill,
+    /// so every painted surface follows the shell's theme instead
+    /// of Wisp's own. Alpha-bearing slots the token set doesn't
+    /// name (placeholder, scrollbar, selection washes) derive from
+    /// the nearest token, the way the built-in tables derive them
+    /// from white/black.
+    pub fn from_tokens(tokens: &TokenColors) -> Self {
+        let surface = token_color(&tokens.surface, rgba(0x202020, 1.0));
+        let raised = token_color(&tokens.raised, rgba(0xFFFFFF, 0.08));
+        let text = token_color(&tokens.foreground, rgba(0xF5F5F5, 1.0));
+        let muted = token_color(&tokens.muted, rgba(0xFFFFFF, 0.58));
+        let accent = token_color(&tokens.accent, rgba(0x22D3EE, 1.0));
+        let with_alpha = |mut c: D2D1_COLOR_F, a: f32| {
+            c.a = a;
+            c
+        };
+        Self {
+            background: surface,
+            text,
+            subtext: muted,
+            placeholder: with_alpha(muted, muted.a * 0.72),
+            row_selected: raised,
+            divider: raised,
+            accent,
+            text_selection: with_alpha(accent, 0.5),
+            tile: raised,
+            scrollbar: with_alpha(muted, muted.a * 0.4),
+            background_solid: surface,
+        }
+    }
+
     /// A translucent fill lets the acrylic or mica backdrop show through.
     pub fn new(dark: bool, translucent: bool) -> Self {
         if dark {

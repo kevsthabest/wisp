@@ -137,6 +137,14 @@ pub fn run() -> Result<()> {
     let _trace = util::perf::Session::new();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |name: &str| args.iter().any(|a| a == name);
+    // The shell platform is chosen before any window exists
+    // (src/backend.rs): --coquille means the Coquille supervisor
+    // spawned us into a standalone session.
+    crate::backend::init(if flag("--coquille") {
+        crate::backend::Backend::StandaloneShell
+    } else {
+        crate::backend::Backend::ExplorerBridge
+    });
 
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -498,6 +506,12 @@ struct Scope {
 
 impl Launcher {
     fn start(&mut self) {
+        if crate::backend::is_standalone() {
+            // The pipe client's threads outlive every surface;
+            // they feed the tray model and theme as the shell
+            // publishes them.
+            crate::coquille::start(self.hwnd);
+        }
         self.sync_shell();
         self.apply_theme();
         self.set_collapsed_style(true);
@@ -615,7 +629,14 @@ impl Launcher {
             dock.set_window_list_mode(self.config.window_list);
             dock.set_app_icon_size(self.config.dock_icon_size as u32);
             // Notification icons need a home while the taskbar is hidden.
-            dock.set_tray(self.taskbar.as_ref().is_some_and(TaskbarHider::is_active));
+            // Standalone: their home is the broker's feed, gated on
+            // the pipe being up — there is no taskbar to hide.
+            let tray_on = if crate::backend::is_standalone() {
+                crate::coquille::connected()
+            } else {
+                self.taskbar.as_ref().is_some_and(TaskbarHider::is_active)
+            };
+            dock.set_tray(tray_on);
             dock.set_autohide(self.config.dock_autohide);
             if self.visible { dock.hide() } else { dock.show() }
         }
@@ -625,6 +646,19 @@ impl Launcher {
     /// Keeps maximized windows above a dock that stays visible while the
     /// taskbar is hidden. A shown taskbar keeps its own space.
     fn sync_reserve(&mut self) {
+        if crate::backend::is_standalone() {
+            // The reservation is the shell's to apply: send the
+            // dock's strip over the pipe instead of running an
+            // AppBar or reclaiming with SPI_SETWORKAREA (both are
+            // Explorer-protocol moves; the broker declines them).
+            let wanted = self.dock.as_ref().is_some_and(Dock::stays_visible);
+            let height = self
+                .dock
+                .as_ref()
+                .map_or(dock::DEFAULT_RESERVED_HEIGHT, Dock::reserved_height);
+            crate::coquille::set_work_area(wanted, height.round() as i32);
+            return;
+        }
         let hidden = self.taskbar.as_ref().is_some_and(TaskbarHider::is_active);
         let wanted = hidden && self.dock.as_ref().is_some_and(Dock::stays_visible);
         let reserved_height = self
@@ -693,6 +727,14 @@ impl Launcher {
     /// Only the taskbar and the dock's notification area change here, so a
     /// retry cannot touch the launcher or the dock's visibility.
     fn sync_taskbar(&mut self) {
+        if crate::backend::is_standalone() {
+            // No Explorer taskbar exists to hide or restore; the
+            // tray's home is the broker's feed, gated on the pipe.
+            if let Some(dock) = &mut self.dock {
+                dock.set_tray(crate::coquille::connected());
+            }
+            return;
+        }
         let result = match &mut self.taskbar {
             Some(hider) if self.config.hide_taskbar => hider.reapply(),
             _ => TaskbarHider::configure(&mut self.taskbar, self.hwnd, self.config.hide_taskbar),
@@ -758,8 +800,23 @@ impl Launcher {
             Theme::System => !system::system_uses_light_theme(),
         };
         self.palette = crate::theme::apply_backdrop(self.hwnd, dark, self.config.backdrop, self.unified());
+        // Standalone: the shell's pack outranks Wisp's own tables
+        // wherever tokens have arrived (before that, the built-in
+        // palette stands in — the first frame should not wait on
+        // the pipe).
+        let token_palette = if crate::backend::is_standalone() {
+            crate::coquille::tokens().map(|t| Palette::from_tokens(&t))
+        } else {
+            None
+        };
+        if let Some(palette) = &token_palette {
+            self.palette = *palette;
+        }
         if let Some(dock) = &mut self.dock {
-            dock.apply_theme(Palette::new(dark, true), self.config.backdrop);
+            dock.apply_theme(
+                token_palette.unwrap_or_else(|| Palette::new(dark, true)),
+                self.config.backdrop,
+            );
         }
         self.invalidate();
     }
@@ -2281,6 +2338,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_APP_SHOW => {
             with_launcher(Launcher::show);
+        }
+        crate::coquille::WM_APP_THEME => {
+            // Fresh tokens from the shell: re-run the same theme
+            // application a config change would.
+            with_launcher(Launcher::apply_theme);
         }
         #[cfg(feature = "perf-trace")]
         WM_TIMER if wparam.0 == 97 && crate::util::perf::hook_on("WISP_CAPTURE") => {

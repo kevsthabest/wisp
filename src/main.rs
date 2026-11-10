@@ -2,10 +2,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod backend;
 mod calc;
 mod channel;
 mod commands;
 mod config;
+mod coquille;
 mod dock;
 mod drag;
 mod editor;

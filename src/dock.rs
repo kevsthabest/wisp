@@ -526,7 +526,15 @@ impl Dock {
             return;
         }
         if enabled {
-            match TrayHost::start(self.hwnd, WM_TRAY_CHANGED) {
+            // The tray's producer is the only thing the backend
+            // changes: Explorer's proxy, or the Coquille broker's
+            // pipe feed. Everything downstream reads the same model.
+            let started = if crate::backend::is_standalone() {
+                TrayHost::start_standalone(self.hwnd, WM_TRAY_CHANGED)
+            } else {
+                TrayHost::start(self.hwnd, WM_TRAY_CHANGED)
+            };
+            match started {
                 Ok(host) => s.tray_host = Some(host),
                 Err(error) => {
                     eprintln!("Dock notification area: {error}");
@@ -1355,7 +1363,15 @@ impl State {
             other => other,
         };
         self.hide_tip();
-        if let Err(error) = tray_host::invoke(&self.tray[index].icon, action, center.x, center.y) {
+        // Bridge mode posts the callback straight to the owner
+        // window; standalone, the broker owns the owners, so the
+        // gesture relays over the pipe for it to deliver.
+        let result = if crate::backend::is_standalone() {
+            crate::coquille::invoke_tray(&self.tray[index].icon, action, center.x, center.y)
+        } else {
+            tray_host::invoke(&self.tray[index].icon, action, center.x, center.y)
+        };
+        if let Err(error) = result {
             eprintln!("Dock notification icon: {error}");
         }
     }

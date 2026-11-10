@@ -7907,6 +7907,7 @@ version = "0.6.1"
 dependencies = [
  "nucleo-matcher",
  "serde",
+ "serde_json",
  "toml 1.1.8+spec-1.1.0",
  "windows 0.62.2",
  "windows-core 0.62.2",

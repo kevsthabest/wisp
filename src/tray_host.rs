@@ -117,6 +117,29 @@ impl TrayHost {
         }
     }
 
+    /// Standalone mode (Coquille): no proxy thread and no
+    /// Explorer to forward to — the broker across the pipe owns
+    /// the receiver and feeds this `Shared` through
+    /// `remote_apply`. The shared is registered globally because
+    /// the pipe client (crate::coquille) lives outside the dock
+    /// that owns this host; the registration is a Weak so a closed
+    /// dock takes the feed down with it.
+    pub fn start_standalone(notify: HWND, msg: u32) -> Result<Self> {
+        let shared = Arc::new(Shared {
+            model: Mutex::default(),
+            rects: Mutex::default(),
+            notify: AtomicUsize::new(notify.0 as usize),
+            notify_msg: msg,
+            pending: AtomicBool::new(false),
+        });
+        *REMOTE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&shared));
+        Ok(Self {
+            shared,
+            control: HWND::default(),
+            thread: None,
+        })
+    }
+
     /// The current icons, in Windows' order where it has one.
     pub fn icons(&self) -> Vec<Icon> {
         self.shared.pending.store(false, Ordering::SeqCst);
@@ -139,14 +162,54 @@ impl TrayHost {
 
 impl Drop for TrayHost {
     fn drop(&mut self) {
-        unsafe {
-            let _ = PostMessageW(Some(self.control), WM_CLOSE, WPARAM(0), LPARAM(0));
+        if !self.control.is_invalid() {
+            unsafe {
+                let _ = PostMessageW(Some(self.control), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
         }
         // Forwarding is bounded by its timeout, so this ends soon.
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
+}
+
+/// The standalone feed's target: the `Shared` of the currently
+/// hosted (standalone) tray, registered by `start_standalone`.
+static REMOTE: Mutex<Option<std::sync::Weak<Shared>>> = Mutex::new(None);
+
+fn remote_shared() -> Option<Arc<Shared>> {
+    REMOTE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade)
+}
+
+/// Whether a standalone tray host is currently registered.
+pub fn remote_active() -> bool {
+    remote_shared().is_some()
+}
+
+/// Identity of the registered standalone shared, so the pipe
+/// client can tell a *replacement* host (dock closed and
+/// reopened) from the one it already fed.
+pub fn remote_id() -> usize {
+    remote_shared().map(|s| Arc::as_ptr(&s) as usize).unwrap_or(0)
+}
+
+/// Applies one broker-fed packet to the standalone model. The
+/// broker's apply is the acceptance Explorer's verdict used to
+/// provide, so `accepted` is unconditionally true here.
+pub fn remote_apply(n: &wire::Notify, image: Option<Option<Arc<OwnedIcon>>>, owner: model::Owner) -> bool {
+    let Some(shared) = remote_shared() else {
+        return false;
+    };
+    let changed = lock(&shared.model).apply(n, true, image, owner);
+    if changed {
+        shared.changed();
+    }
+    changed
 }
 
 /// Sends an app its callback for a gesture on its icon, as Explorer would.

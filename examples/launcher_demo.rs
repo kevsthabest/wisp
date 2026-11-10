@@ -1,12 +1,16 @@
 #![allow(dead_code)]
 #[path = "../src/app.rs"]
 mod app;
+#[path = "../src/backend.rs"]
+mod backend;
 #[path = "../src/calc.rs"]
 mod calc;
 #[path = "../src/commands/mod.rs"]
 mod commands;
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/coquille.rs"]
+mod coquille;
 #[path = "../src/dock.rs"]
 mod dock;
 #[path = "../src/drag.rs"]
