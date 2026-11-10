@@ -266,6 +266,11 @@ fn handle_line(line: &str) {
             // hotkey path ends at. Narrated because this is the
             // only evidence the request crossed the pipe.
             eprintln!("[coquille] launcher event: show_launcher — opening the launcher");
+            // Label the open bus-raised, so the launcher's focus
+            // narration can tell it from a hotkey open: this route
+            // carries no input event, and its focus is the kind
+            // that can silently fail.
+            crate::app::BUS_SHOW.store(true, Ordering::SeqCst);
             post_launcher(WM_APP_SHOW);
         }
         _ => {}

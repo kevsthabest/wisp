@@ -11,7 +11,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Ole::DROPEFFECT_NONE;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{AttachThreadInput, CreateMutexW, GetCurrentThreadId};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -46,6 +46,8 @@ const WM_APP_RELOAD: u32 = WM_APP + 6;
 const REEL_TIMER: usize = 96;
 const REEL_MS: u32 = 50;
 const WM_APP_COMMANDS: u32 = WM_APP + 7;
+/// Posted by the launch worker when an activation's outcome waits.
+const WM_APP_LAUNCH: u32 = WM_APP + 10;
 const CLASS_NAME: PCWSTR = crate::channel::LAUNCHER_CLASS;
 const HOTKEY_ID: i32 = 1;
 const CARET_TIMER: usize = 1;
@@ -75,6 +77,12 @@ const DEFER_INDEX: u8 = 1;
 const DEFER_FILES: u8 = 4;
 const DEFER_HIDE: u8 = 2;
 const DEFER_COMMANDS: u8 = 8;
+const DEFER_LAUNCH: u8 = 16;
+
+/// Set by the Coquille pipe client just before it posts WM_APP_SHOW,
+/// so the open it causes can be narrated as bus-raised. The label is
+/// cosmetic (one log line per open), so a racy read costs nothing.
+pub static BUS_SHOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
     static LAUNCHER: RefCell<Option<Launcher>> = const { RefCell::new(None) };
@@ -119,6 +127,9 @@ fn run_deferred() {
                 }
                 if work & DEFER_COMMANDS != 0 {
                     l.drain_command_events();
+                }
+                if work & DEFER_LAUNCH != 0 {
+                    l.drain_launch_events();
                 }
                 if work & DEFER_HIDE != 0 {
                     l.hide();
@@ -242,6 +253,7 @@ pub fn run() -> Result<()> {
         // Icons are drawn at 32 DIPs; extract them at the system DPI's pixel size.
         let icon_size = (32 * system_dpi as i32 + 95) / 96;
         let (commands, command_events) = Commands::spawn(hwnd, WM_APP_COMMANDS, icon_size);
+        let (launch_worker, launch_events) = launch::LaunchWorker::spawn(hwnd, WM_APP_LAUNCH);
         let launcher = Launcher {
             hwnd,
             config,
@@ -277,6 +289,10 @@ pub fn run() -> Result<()> {
             commands,
             command_events,
             command_state: commands::State::default(),
+            launch_worker,
+            launch_events,
+            pending_launch: None,
+            show_source: "internal",
             list: None,
             armed: None,
             scope: None,
@@ -394,6 +410,16 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+/// What a dispatched activation needs when its outcome lands: the
+/// history id to record on success, and the words a failure notice
+/// is built from — the same follow-ups the synchronous path applies
+/// inline in `perform`.
+struct PendingLaunch {
+    id: Option<String>,
+    title: String,
+    kind: Kind,
+}
+
 struct Launcher {
     hwnd: HWND,
     config: Config,
@@ -442,6 +468,17 @@ struct Launcher {
     commands: Commands,
     command_events: Receiver<commands::Event>,
     command_state: commands::State,
+    /// Activations dispatched off this thread in a standalone
+    /// session, and the one currently in flight, if any. While a
+    /// launch is in flight further activations wait: the synchronous
+    /// path got that exclusion from blocking, and a second Enter
+    /// must not double-launch an app.
+    launch_worker: launch::LaunchWorker,
+    launch_events: Receiver<launch::LaunchOutcome>,
+    pending_launch: Option<PendingLaunch>,
+    /// What raised the current open (hotkey, bus, show, internal),
+    /// for the focus narration in `confirm_search_focus`.
+    show_source: &'static str,
     /// The items of the open list, such as Wi-Fi networks. `None` while loading.
     list: Option<Vec<ResultItem>>,
     /// A command waiting for a second Enter, such as Restart.
@@ -502,6 +539,56 @@ struct Scope {
     actions: Vec<ResultItem>,
     /// The query before Tab. Leaving the list restores it.
     query: String,
+}
+
+fn is_foreground(hwnd: HWND) -> bool {
+    let foreground = unsafe { GetForegroundWindow() };
+    foreground == hwnd
+}
+
+/// The foreground window's class, for the focus narration: when the
+/// launcher loses the foreground race, the winner's class is the
+/// first thing worth knowing.
+fn foreground_class() -> String {
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.is_invalid() {
+            return "no window".into();
+        }
+        let mut buf = [0u16; 128];
+        let len = GetClassNameW(foreground, &mut buf);
+        if len <= 0 {
+            return "an unnamed window".into();
+        }
+        String::from_utf16_lossy(&buf[..len as usize])
+    }
+}
+
+/// The shell-bound activations in an `Action`, as a request the
+/// launch worker can run. Everything else (clipboard, commands,
+/// surfaces) is local or already worker-backed and returns `None`.
+fn launch_request(action: &Action, admin: bool) -> Option<launch::LaunchRequest> {
+    match action {
+        Action::Launch {
+            id,
+            path,
+            admin: as_admin,
+        } => Some(launch::LaunchRequest::App {
+            id: id.clone(),
+            path: path.clone(),
+            admin: admin || *as_admin,
+        }),
+        Action::Open(target) => Some(launch::LaunchRequest::Open(target.clone())),
+        Action::Shell {
+            command,
+            admin: as_admin,
+        } if !command.is_empty() => Some(launch::LaunchRequest::Shell {
+            command: command.clone(),
+            admin: admin || *as_admin,
+        }),
+        Action::Reveal(path) => Some(launch::LaunchRequest::Reveal(path.clone())),
+        _ => None,
+    }
 }
 
 impl Launcher {
@@ -943,8 +1030,52 @@ impl Launcher {
                 SendMessageW(self.hwnd, WM_NCACTIVATE, Some(WPARAM(1)), Some(LPARAM(-1)));
             }
         }
+        if !crate::util::perf::hook_on("WISP_CAPTURE") {
+            self.confirm_search_focus();
+        }
         self.restart_caret();
         self.paint();
+    }
+
+    /// The search box is this window's own editor: keystrokes land
+    /// only if the window truly holds the foreground. A hotkey press
+    /// grants that right, but a bus-raised open does not — the click
+    /// that asked for the launcher landed in another process (the
+    /// shell's chrome), so `SetForegroundWindow` can quietly fail
+    /// and leave a launcher that cannot be typed into. Verify; in a
+    /// standalone session, escalate once by borrowing the foreground
+    /// thread's input queue while setting focus — the standard
+    /// launcher manoeuvre — and narrate the verdict either way, so
+    /// the log settles whether an untypable launcher was ever a
+    /// focus failure. Bridge mode keeps the historical behaviour:
+    /// verify and narrate only.
+    fn confirm_search_focus(&mut self) {
+        if !is_foreground(self.hwnd) && crate::backend::is_standalone() {
+            unsafe {
+                let foreground = GetForegroundWindow();
+                if !foreground.is_invalid() {
+                    let fg_thread = GetWindowThreadProcessId(foreground, None);
+                    let my_thread = GetCurrentThreadId();
+                    if fg_thread != 0
+                        && fg_thread != my_thread
+                        && AttachThreadInput(my_thread, fg_thread, true).as_bool()
+                    {
+                        let _ = SetForegroundWindow(self.hwnd);
+                        let _ = SetFocus(Some(self.hwnd));
+                        let _ = AttachThreadInput(my_thread, fg_thread, false);
+                    }
+                }
+            }
+        }
+        if is_foreground(self.hwnd) {
+            eprintln!("[launcher] opened ({}): search focused", self.show_source);
+        } else {
+            eprintln!(
+                "[launcher] opened ({}): search NOT focused — foreground is {}",
+                self.show_source,
+                foreground_class()
+            );
+        }
     }
 
     fn hide(&mut self) {
@@ -1428,6 +1559,35 @@ impl Launcher {
     }
 
     fn perform(&mut self, action: &Action, title: &str, kind: Kind, admin: bool) {
+        // Shell activations end in ShellExecuteExW. For an immersive
+        // app or an ms-settings: link that call waits on activation
+        // infrastructure Explorer normally keeps warm; in a
+        // standalone session it can wait forever, and it would take
+        // the dock down with it — they share this thread. So a
+        // standalone session dispatches the activation to the launch
+        // worker and applies the outcome when it lands as a message
+        // (drain_launch_events). Bridge mode keeps the synchronous
+        // call it has always made.
+        if crate::backend::is_standalone()
+            && let Some(request) = launch_request(action, admin)
+        {
+            if self.pending_launch.is_some() {
+                eprintln!("[launcher] activation of \"{title}\" ignored: another launch is still in flight");
+                return;
+            }
+            let id = match action {
+                Action::Launch { id, .. } => Some(id.clone()),
+                _ => None,
+            };
+            eprintln!("[launcher] launch dispatched: {} (\"{title}\")", request.describe());
+            self.pending_launch = Some(PendingLaunch {
+                id,
+                title: title.to_string(),
+                kind,
+            });
+            self.launch_worker.dispatch(request);
+            return;
+        }
         let outcome = match action {
             Action::Launch {
                 id,
@@ -1468,6 +1628,36 @@ impl Launcher {
                 &e.message(),
                 true,
             ),
+        }
+    }
+
+    /// Applies a dispatched activation's outcome with exactly the
+    /// follow-ups the synchronous path applies inline: record the
+    /// history and refresh the dock on success, then hide; stay
+    /// silent and open when the user cancelled; notify on failure.
+    fn drain_launch_events(&mut self) {
+        while let Ok(outcome) = self.launch_events.try_recv() {
+            let Some(pending) = self.pending_launch.take() else {
+                continue;
+            };
+            match outcome {
+                launch::LaunchOutcome::Ok => {
+                    if let Some(id) = &pending.id {
+                        self.history.record(id);
+                        self.update_dock_apps();
+                    }
+                    self.hide();
+                }
+                launch::LaunchOutcome::Cancelled => {}
+                launch::LaunchOutcome::Failed(message) => {
+                    tray::notify(
+                        self.hwnd,
+                        &format!("Could not {} {}", pending.kind.verb().to_lowercase(), pending.title),
+                        &message,
+                        true,
+                    );
+                }
+            }
         }
     }
 
@@ -2374,10 +2564,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_NCHITTEST => return LRESULT(HTCLIENT as isize),
         WM_HOTKEY => {
             util::perf::input("hotkey_to_content");
-            with_launcher(Launcher::toggle);
+            with_launcher(|l| {
+                l.show_source = "hotkey";
+                l.toggle();
+            });
         }
         WM_APP_SHOW => {
-            with_launcher(Launcher::show);
+            with_launcher(|l| {
+                l.show_source = if BUS_SHOW.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    "bus"
+                } else {
+                    "show"
+                };
+                l.show();
+            });
         }
         crate::coquille::WM_APP_THEME => {
             // Fresh tokens from the shell: re-run the same theme
@@ -2507,6 +2707,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_INDEX => with_launcher_or_defer(DEFER_INDEX, Launcher::drain_index_events),
         WM_APP_FILES => with_launcher_or_defer(DEFER_FILES, Launcher::drain_file_results),
         WM_APP_COMMANDS => with_launcher_or_defer(DEFER_COMMANDS, Launcher::drain_command_events),
+        WM_APP_LAUNCH => with_launcher_or_defer(DEFER_LAUNCH, Launcher::drain_launch_events),
         WM_ACTIVATE if loword(wparam.0) == WA_INACTIVE => with_launcher_or_defer(DEFER_HIDE, Launcher::hide),
         WM_DPICHANGED => {
             with_launcher(|l| l.on_dpi_changed(loword(wparam.0)));
@@ -2698,7 +2899,68 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
 #[cfg(test)]
 mod tests {
-    use super::mouse_moved;
+    use super::{launch_request, mouse_moved};
+    use crate::launch::LaunchRequest;
+    use crate::search::Action;
+
+    #[test]
+    fn shell_bound_actions_become_launch_requests() {
+        assert_eq!(
+            launch_request(&Action::Open("ms-settings:personalization-background".into()), false,),
+            Some(LaunchRequest::Open("ms-settings:personalization-background".into()))
+        );
+        // The caller's admin flag and the action's own combine.
+        assert_eq!(
+            launch_request(
+                &Action::Launch {
+                    id: "app".into(),
+                    path: None,
+                    admin: false,
+                },
+                true,
+            ),
+            Some(LaunchRequest::App {
+                id: "app".into(),
+                path: None,
+                admin: true,
+            })
+        );
+        assert_eq!(
+            launch_request(
+                &Action::Shell {
+                    command: "dir".into(),
+                    admin: false,
+                },
+                false,
+            ),
+            Some(LaunchRequest::Shell {
+                command: "dir".into(),
+                admin: false,
+            })
+        );
+        assert_eq!(
+            launch_request(&Action::Reveal("C:\\f.txt".into()), false),
+            Some(LaunchRequest::Reveal("C:\\f.txt".into()))
+        );
+    }
+
+    #[test]
+    fn local_actions_stay_on_the_ui_thread() {
+        // An empty shell command is perform's early return, not a launch.
+        assert_eq!(
+            launch_request(
+                &Action::Shell {
+                    command: String::new(),
+                    admin: false,
+                },
+                false,
+            ),
+            None
+        );
+        assert_eq!(launch_request(&Action::Copy("1".into()), false), None);
+        assert_eq!(launch_request(&Action::None, false), None);
+        assert_eq!(launch_request(&Action::Surface(0), false), None);
+    }
 
     #[test]
     fn stationary_cursor_keeps_selection_across_layout_changes() {
