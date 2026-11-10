@@ -29,7 +29,21 @@ use crate::tray_host::model::Owner;
 use crate::tray_host::wire::{self, Notify};
 use crate::tray_host::{self, OwnedIcon};
 
-const PIPE_PATH: &str = r"\\.\pipe\coquille-supervisor-v1";
+/// The supervisor's pipe path, session-scoped. Coquille's name
+/// format is `\\.\pipe\coquille-supervisor-v1-s<session id>`
+/// (hand-mirrored like the rest of the protocol here — the fork
+/// carries no Coquille crate dependency). The pipe namespace is
+/// machine-global while shells are per-session: without the
+/// suffix, two signed-in sessions' supervisors would share one
+/// name and this client could land on the wrong session's shell.
+fn pipe_path() -> String {
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    let mut session = 0u32;
+    let _ = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+    format!(r"\\.\pipe\coquille-supervisor-v1-s{session}")
+}
+
 const PROTOCOL_VERSION: u32 = 1;
 
 /// Mirrors the launcher's own constant (src/app.rs) — a
@@ -147,7 +161,8 @@ pub fn start(launcher: HWND) {
 }
 
 fn session() -> std::io::Result<()> {
-    let file = std::fs::OpenOptions::new().read(true).write(true).open(PIPE_PATH)?;
+    let path = pipe_path();
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(&path)?;
     let mut writer = file.try_clone()?;
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::Builder::new()
@@ -174,7 +189,7 @@ fn session() -> std::io::Result<()> {
         serde_json::json!({ "topics": ["tray", "theme", "launcher"] }),
     );
     CONNECTED.store(true, Ordering::SeqCst);
-    eprintln!("[coquille] pipe session up (hello + subscribe sent)");
+    eprintln!("[coquille] pipe session up on {path} (hello + subscribe sent)");
 
     let reader = BufReader::new(file);
     for line in reader.lines() {
