@@ -54,14 +54,32 @@ pub fn update(old: Vec<Shown>, icons: Vec<Icon>, size: i32) -> (Vec<Shown>, Vec<
             Shown { icon, pixels }
         })
         .collect();
+    let standalone = crate::backend::is_standalone();
     let inline = shown
         .iter()
         .enumerate()
-        .filter(|(_, shown)| shown.icon.promoted == Some(true) && shown.pixels.is_some())
+        .filter(|(_, shown)| shown.pixels.is_some() && inline_eligible(shown.icon.promoted, standalone))
         .map(|(index, _)| index)
         .take(logic::MAX_INLINE)
         .collect();
     (shown, inline)
+}
+
+/// Whether a shown icon earns a place in the strip itself
+/// rather than the chevron flyout. Bridge mode follows the
+/// promotion preference Explorer recorded in
+/// NotifyIconSettings: only a promoted icon is inline. The
+/// standalone feed has no such record to read — the broker
+/// never sends one — so every icon it shows is inline unless
+/// something explicitly demoted it; the broker's own hidden
+/// flag (already filtered out of `shown`) is the overflow
+/// split there, the same rule the shell's native bar applies.
+fn inline_eligible(promoted: Option<bool>, standalone: bool) -> bool {
+    if standalone {
+        promoted != Some(false)
+    } else {
+        promoted == Some(true)
+    }
 }
 
 /// The largest size an icon is drawn at before resampling. Tray icons are
@@ -278,6 +296,22 @@ mod tests {
 
     fn pixels(width: u32, height: u32, bgra: Vec<u8>) -> IconPixels {
         IconPixels { width, height, bgra }
+    }
+
+    #[test]
+    fn inline_follows_promotion_in_bridge_and_presence_in_standalone() {
+        // Bridge: only an explicit promotion is inline; an
+        // unrecorded preference stays in the flyout, as
+        // Explorer leaves it in the overflow.
+        assert!(inline_eligible(Some(true), false));
+        assert!(!inline_eligible(Some(false), false));
+        assert!(!inline_eligible(None, false));
+        // Standalone: no preference exists to consult, so a
+        // shown icon is inline; only an explicit demotion —
+        // which nothing in the feed currently sends — is not.
+        assert!(inline_eligible(Some(true), true));
+        assert!(inline_eligible(None, true));
+        assert!(!inline_eligible(Some(false), true));
     }
 
     #[test]

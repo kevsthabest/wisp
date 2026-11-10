@@ -175,6 +175,10 @@ struct State {
     windows_thumbs: thumbs::Thumbs,
     /// The last click on a notification icon, to tell double clicks.
     tray_click: Option<(tray_host::Key, Instant)>,
+    /// The foreground class the narration last reported as
+    /// blocking a reveal, so the poll loop (10×/s) reports a
+    /// blocked reveal once per blocking window, not forever.
+    block_class: String,
     /// The demo's flyout and its hovered icon, applied as icons arrive.
     held_flyout: Option<Option<usize>>,
 }
@@ -262,6 +266,7 @@ impl Dock {
             windows_thumbs: thumbs::Thumbs::new(),
             tray_click: None,
             held_flyout: None,
+            block_class: String::new(),
         }));
         let instance = unsafe { GetModuleHandleW(None)? };
         let class = WNDCLASSEXW {
@@ -415,7 +420,7 @@ impl Dock {
     pub fn capture_reveal(&mut self) {
         let mut s = self.state.borrow_mut();
         s.held = true;
-        s.reveal();
+        s.reveal("capture hold");
     }
 
     pub fn capture_slide(&mut self) {
@@ -465,6 +470,7 @@ impl Dock {
         }
         s.stop_slide();
         s.suspended = true;
+        s.narrate("suspend: the launcher takes the surface; the edge poll is off");
         rect
     }
 
@@ -480,6 +486,7 @@ impl Dock {
         unsafe {
             SetTimer(Some(self.hwnd), POLL_TIMER, POLL_MS, None);
         }
+        s.narrate("resume: back from the launcher; the edge poll is on");
     }
 
     pub fn surface_rect(&mut self, rect: RECT) {
@@ -600,6 +607,11 @@ impl Dock {
         unsafe {
             SetTimer(Some(self.hwnd), POLL_TIMER, POLL_MS, None);
         }
+        s.narrate(if revealed {
+            "present: shown revealed"
+        } else {
+            "present: shown, autohide decides"
+        });
         s.refresh();
     }
     /// Reveals the dock for good, with a fixed hover, so screenshots can show it
@@ -626,7 +638,7 @@ impl Dock {
         s.held_flyout = hover_part
             .and_then(|part| part.strip_prefix("flyout"))
             .map(|rest| rest.parse().ok());
-        s.reveal();
+        s.reveal("held for capture");
         s.stop_slide();
         s.place();
         if hover_part == Some("desktops") {
@@ -642,7 +654,7 @@ impl Dock {
         }
         s.autohide = autohide;
         if !autohide && s.visible && !s.suspended && !s.revealed {
-            s.reveal();
+            s.reveal("autohide turned off");
         } else {
             // Move to the primary screen, or start the hide countdown.
             s.away = 0;
@@ -695,6 +707,7 @@ impl Dock {
             let _ = KillTimer(Some(self.hwnd), POLL_TIMER);
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
+        s.narrate("hide: hidden until shown again (the launcher is open, or a sync asked)");
     }
 }
 
@@ -865,6 +878,9 @@ impl State {
             self.refresh_window_titles();
         }
         if self.fullscreen {
+            if self.revealed || self.slide.is_some() {
+                self.narrate("hide: refresh latched a fullscreen foreground");
+            }
             self.hide_windows();
             self.stop_slide();
             self.revealed = false;
@@ -904,13 +920,15 @@ impl State {
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
+            self.narrate("hide: a fullscreen app holds the foreground");
             return;
         }
         if !self.revealed {
+            let fullscreen = fullscreen_foreground(self.hwnd);
             if !self.autohide {
                 // Back after a fullscreen app, or after the launcher closed.
-                if !fullscreen_foreground(self.hwnd) {
-                    self.reveal();
+                if !fullscreen {
+                    self.reveal("poll: the dock does not autohide");
                 }
                 return;
             }
@@ -925,8 +943,22 @@ impl State {
                 GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &mut info).as_bool()
                     && at_anchor_edge(cursor, self.edge, &info)
             };
-            if !dragging && on_edge && !fullscreen_foreground(self.hwnd) {
-                self.reveal();
+            if !dragging && on_edge {
+                if fullscreen {
+                    // The wedge this guards: the pointer is at
+                    // the edge asking for the dock, and only the
+                    // fullscreen test says no. Say which window
+                    // that is — once per window, not per poll.
+                    let class = foreground_class();
+                    if self.block_class != class {
+                        self.block_class = class.clone();
+                        self.narrate(&format!(
+                            "reveal blocked: fullscreen foreground is {class:?}; the dock stays hidden until it yields"
+                        ));
+                    }
+                } else {
+                    self.reveal("poll: pointer at the anchor edge");
+                }
             }
             return;
         }
@@ -982,6 +1014,7 @@ impl State {
                 self.hide_windows();
                 self.revealed = false;
                 self.start_slide(1.0);
+                self.narrate("hide: the pointer has been away");
                 return;
             }
         }
@@ -989,14 +1022,31 @@ impl State {
         self.update_status();
     }
 
+    /// One line of stderr narration for a hide/show transition,
+    /// with the state that explains it. Hide/show wedges are
+    /// invisible without this: the dock writes no log of its
+    /// own, and a stuck state looks identical to a dead process
+    /// from outside.
+    fn narrate(&self, transition: &str) {
+        eprintln!(
+            "[dock] {transition} (revealed={} slide_to={} fullscreen={} autohide={} suspended={})",
+            self.revealed, self.slide_to, self.fullscreen, self.autohide, self.suspended
+        );
+    }
+
     /// Shows the dock, or reverses an outgoing slide at its current position.
-    fn reveal(&mut self) {
+    fn reveal(&mut self, why: &str) {
         let hidden = !self.revealed && self.slide.is_none();
+        let reversing = self.slide.is_some() && self.slide_to > 0.5;
         self.revealed = true;
         self.away = 0;
         if hidden {
             self.slide_to = 1.0;
         }
+        if hidden || reversing {
+            self.narrate(&format!("show: {why}"));
+        }
+        self.block_class.clear();
         self.start_slide(0.0);
         self.refresh();
     }
@@ -2164,6 +2214,64 @@ fn at_anchor_edge(cursor: POINT, edge: logic::Edge, info: &MONITORINFO) -> bool 
     }
 }
 
+/// The foreground window's class, for narration.
+fn foreground_class() -> String {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return String::new();
+        }
+        let mut class = [0u16; 128];
+        let len = GetClassNameW(hwnd, &mut class);
+        String::from_utf16_lossy(&class[..len.max(0) as usize])
+    }
+}
+
+/// What the fullscreen test looks at, gathered from Win32 so
+/// the decision itself is a pure function with tests.
+struct ForegroundFacts {
+    class: String,
+    /// The window's rect covers its monitor on all four sides.
+    covers: bool,
+    zoomed: bool,
+    /// The rect is exactly the monitor (a maximized window's
+    /// borders spill past it; a true fullscreen's do not).
+    exact_monitor: bool,
+    /// The work area fills the monitor (nothing reserved).
+    work_is_monitor: bool,
+}
+
+/// Whether a foreground window is a fullscreen app the dock
+/// must yield to — as opposed to a shell surface, which only
+/// *looks* like one: it covers its monitor by design and
+/// holds the foreground whenever the user clicks the desktop
+/// or the last app window closes. Explorer's desktop classes
+/// were always exempt for exactly that reason. A standalone
+/// session's desktop is the shell host's full-monitor window
+/// (`CoquilleDesktop`), and without the same exemption this
+/// test latched the dock hidden for as long as the desktop
+/// held the foreground: refresh hid it, and every poll's edge
+/// probe was refused by this test, until some ordinary window
+/// — the emergency launcher, say — took the foreground and
+/// unstuck it. In bridge mode the class carries no meaning
+/// and the verdict is what it always was.
+fn fullscreen_cover(facts: &ForegroundFacts, standalone: bool) -> bool {
+    if matches!(
+        facts.class.as_str(),
+        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+    ) {
+        return false;
+    }
+    if standalone && facts.class == "CoquilleDesktop" {
+        return false;
+    }
+    // Maximized windows have resize borders outside the monitor; don't
+    // treat those as fullscreen. Some apps go fullscreen from maximized,
+    // though: that shows when the window fills the monitor exactly while
+    // the work area, and so a plain maximize, stops short of it.
+    facts.covers && (!facts.zoomed || (facts.exact_monitor && !facts.work_is_monitor))
+}
+
 fn fullscreen_foreground(dock: HWND) -> bool {
     unsafe {
         let hwnd = GetForegroundWindow();
@@ -2172,12 +2280,7 @@ fn fullscreen_foreground(dock: HWND) -> bool {
         }
         let mut class = [0u16; 128];
         let len = GetClassNameW(hwnd, &mut class);
-        if matches!(
-            String::from_utf16_lossy(&class[..len as usize]).as_str(),
-            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
-        ) {
-            return false;
-        }
+        let class = String::from_utf16_lossy(&class[..len.max(0) as usize]);
         let mut rect = RECT::default();
         let mut info = MONITORINFO {
             cbSize: size_of::<MONITORINFO>() as u32,
@@ -2188,15 +2291,17 @@ fn fullscreen_foreground(dock: HWND) -> bool {
         {
             return false;
         }
-        let covers = rect.left <= info.rcMonitor.left
-            && rect.top <= info.rcMonitor.top
-            && rect.right >= info.rcMonitor.right
-            && rect.bottom >= info.rcMonitor.bottom;
-        // Maximized windows have resize borders outside the monitor; don't
-        // treat those as fullscreen. Some apps go fullscreen from maximized,
-        // though: that shows when the window fills the monitor exactly while
-        // the work area, and so a plain maximize, stops short of it.
-        covers && (!IsZoomed(hwnd).as_bool() || (rect == info.rcMonitor && info.rcWork != info.rcMonitor))
+        let facts = ForegroundFacts {
+            class,
+            covers: rect.left <= info.rcMonitor.left
+                && rect.top <= info.rcMonitor.top
+                && rect.right >= info.rcMonitor.right
+                && rect.bottom >= info.rcMonitor.bottom,
+            zoomed: IsZoomed(hwnd).as_bool(),
+            exact_monitor: rect == info.rcMonitor,
+            work_is_monitor: info.rcWork == info.rcMonitor,
+        };
+        fullscreen_cover(&facts, crate::backend::is_standalone())
     }
 }
 
@@ -2686,5 +2791,77 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
         drop(s);
         DefWindowProcW(hwnd, msg, wp, lp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn facts(class: &str, covers: bool, zoomed: bool, exact_monitor: bool, work_is_monitor: bool) -> ForegroundFacts {
+        ForegroundFacts {
+            class: class.into(),
+            covers,
+            zoomed,
+            exact_monitor,
+            work_is_monitor,
+        }
+    }
+
+    #[test]
+    fn shell_surfaces_are_never_fullscreen_apps() {
+        // Explorer's desktop and tray classes, either backend.
+        for class in ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"] {
+            for standalone in [false, true] {
+                assert!(
+                    !fullscreen_cover(&facts(class, true, false, true, false), standalone),
+                    "{class}"
+                );
+            }
+        }
+        // The standalone shell's desktop surface: exempt only
+        // in a standalone session, where it is the desktop. In
+        // bridge mode a window of that class would be judged
+        // like any other — the exemption follows the backend,
+        // not the name alone.
+        assert!(!fullscreen_cover(
+            &facts("CoquilleDesktop", true, false, true, false),
+            true
+        ));
+        assert!(fullscreen_cover(
+            &facts("CoquilleDesktop", true, false, true, false),
+            false
+        ));
+    }
+
+    #[test]
+    fn fullscreen_verdicts_follow_the_cover() {
+        // A plain app window that does not cover the monitor.
+        assert!(!fullscreen_cover(
+            &facts("CabinetWClass", false, false, false, false),
+            true
+        ));
+        // Fullscreen from a windowed state: covers, not zoomed.
+        assert!(fullscreen_cover(&facts("mpv", true, false, true, false), true));
+        // A maximized window: covers via its spill-over borders
+        // but is zoomed and not exactly the monitor.
+        assert!(!fullscreen_cover(
+            &facts("CabinetWClass", true, true, false, false),
+            true
+        ));
+        // Fullscreen reached from maximized: zoomed, exactly
+        // the monitor, and the work area falls short of it (a
+        // reservation is in force) — still fullscreen.
+        assert!(fullscreen_cover(
+            &facts("ApplicationFrameWindow", true, true, true, false),
+            true
+        ));
+        // Zoomed, exact, and the work area is the whole monitor:
+        // indistinguishable from a plain maximize on a monitor
+        // with nothing reserved; not fullscreen, as before.
+        assert!(!fullscreen_cover(
+            &facts("ApplicationFrameWindow", true, true, true, true),
+            true
+        ));
     }
 }
