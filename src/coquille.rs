@@ -47,7 +47,16 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static OUTBOUND: OnceLock<Mutex<Option<std::sync::mpsc::Sender<String>>>> = OnceLock::new();
 static TOKENS: Mutex<Option<TokenColors>> = Mutex::new(None);
 static LAST_SNAPSHOT: Mutex<Option<serde_json::Value>> = Mutex::new(None);
-static LAST_WORK_AREA: Mutex<Option<(bool, i32)>> = Mutex::new(None);
+/// The last reservation sent, for dedupe: (wanted, edge,
+/// thickness in DIPs, target monitor).
+type WorkAreaKey = (bool, crate::dock::logic::Edge, i32, Option<String>);
+static LAST_WORK_AREA: Mutex<Option<WorkAreaKey>> = Mutex::new(None);
+/// The edge the shell's config names (decision 13: the shell
+/// owns it; Wisp's own config does not rule in standalone).
+static EDGE_NAME: Mutex<String> = Mutex::new(String::new());
+/// The monitor the shell names for the bar, when it names one
+/// (`None` = primary).
+static TARGET_MONITOR: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn connected() -> bool {
     CONNECTED.load(Ordering::SeqCst)
@@ -55,6 +64,24 @@ pub fn connected() -> bool {
 
 pub fn tokens() -> Option<TokenColors> {
     TOKENS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The dock edge the shell last published; Bottom until it says
+/// otherwise (and in bridge mode, where edges are not applied).
+pub fn edge() -> crate::dock::logic::Edge {
+    use crate::dock::logic::Edge;
+    match EDGE_NAME.lock().unwrap_or_else(|e| e.into_inner()).as_str() {
+        "top" => Edge::Top,
+        "left" => Edge::Left,
+        "right" => Edge::Right,
+        _ => Edge::Bottom,
+    }
+}
+
+/// The monitor the shell named for the bar, by device name;
+/// `None` when it said "primary" or has not said yet.
+pub fn target_monitor() -> Option<String> {
+    TARGET_MONITOR.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 fn outbound() -> &'static Mutex<Option<std::sync::mpsc::Sender<String>>> {
@@ -171,8 +198,31 @@ fn handle_line(line: &str) {
             apply_snapshot(&payload);
         }
         "theme" => {
+            // Placement rides the theme event (it is shell
+            // policy, republished with the pack): store it even
+            // when the token parse is what usually drives this.
+            let edge_name = payload
+                .get("edge")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let monitor = payload
+                .get("taskbar_monitor")
+                .and_then(|v| v.as_str())
+                .filter(|name| !name.is_empty() && *name != "primary")
+                .map(str::to_string);
+            let placement_changed = {
+                let mut edge_slot = EDGE_NAME.lock().unwrap_or_else(|e| e.into_inner());
+                let mut monitor_slot = TARGET_MONITOR.lock().unwrap_or_else(|e| e.into_inner());
+                let changed = *edge_slot != edge_name || *monitor_slot != monitor;
+                *edge_slot = edge_name;
+                *monitor_slot = monitor;
+                changed
+            };
             if let Some(tokens) = parse_tokens(&payload) {
                 *TOKENS.lock().unwrap_or_else(|e| e.into_inner()) = Some(tokens);
+                post_launcher(WM_APP_THEME);
+            } else if placement_changed {
                 post_launcher(WM_APP_THEME);
             }
         }
@@ -504,27 +554,42 @@ pub fn invoke_tray(
     Ok(())
 }
 
-/// Reserves (or releases) the dock's strip of the primary
-/// monitor. In standalone mode the reservation is the shell's to
-/// apply — Wisp sends corners, the host performs the call.
-pub fn set_work_area(wanted: bool, reserved_height: i32) {
+/// Reserves (or releases) the dock's strip on the monitor the
+/// shell named for the bar (the primary by default). In
+/// standalone mode the reservation is the shell's to apply —
+/// Wisp sends corners, the host performs the call. The strip is
+/// the edge's: bottom/top shave the height, left/right the
+/// width. `thickness_dip` is in DIPs and converted here, where
+/// the target monitor's DPI is known — callers further up only
+/// have the dock's.
+pub fn set_work_area(wanted: bool, thickness_dip: i32) {
+    let edge = edge();
+    let monitor_name = target_monitor();
     {
         let mut last = LAST_WORK_AREA.lock().unwrap_or_else(|e| e.into_inner());
-        if *last == Some((wanted, reserved_height)) {
+        let key = (wanted, edge, thickness_dip, monitor_name.clone());
+        if *last == Some(key.clone()) {
             return;
         }
-        *last = Some((wanted, reserved_height));
+        *last = Some(key);
     }
-    let (left, top, right, bottom) = primary_monitor_rect();
-    let bottom = if wanted {
-        bottom - reserved_height.max(0)
+    let (left, top, right, bottom, dpi) = monitor_rect_and_dpi(monitor_name.as_deref());
+    let thickness = (thickness_dip.max(0) as f32 * dpi as f32 / 96.0).round() as i32;
+    let (left, top, right, bottom) = if !wanted {
+        (left, top, right, bottom)
     } else {
-        bottom
+        use crate::dock::logic::Edge;
+        match edge {
+            Edge::Bottom => (left, top, right, bottom - thickness),
+            Edge::Top => (left, top + thickness, right, bottom),
+            Edge::Left => (left + thickness, top, right, bottom),
+            Edge::Right => (left, top, right - thickness, bottom),
+        }
     };
     send_request(
         "set_work_area",
         serde_json::json!({
-            "monitor": "primary",
+            "monitor": monitor_name.as_deref().unwrap_or("primary"),
             "left": left,
             "top": top,
             "right": right,
@@ -534,19 +599,26 @@ pub fn set_work_area(wanted: bool, reserved_height: i32) {
     );
 }
 
-fn primary_monitor_rect() -> (i32, i32, i32, i32) {
+/// The named monitor's rect and DPI, or the primary's when the
+/// name is absent or not found.
+fn monitor_rect_and_dpi(name: Option<&str>) -> (i32, i32, i32, i32, u32) {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint};
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     unsafe {
-        let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let named = name.and_then(crate::dock::monitor_by_name);
+        let monitor = named.unwrap_or_else(|| MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY));
+        let mut dpi = 96u32;
+        let mut dpi_y = 0u32;
+        let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y);
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
         if GetMonitorInfoW(monitor, &mut info).as_bool() {
             let r = info.rcMonitor;
-            return (r.left, r.top, r.right, r.bottom);
+            return (r.left, r.top, r.right, r.bottom, dpi.max(96));
         }
-        (0, 0, 1920, 1080)
+        (0, 0, 1920, 1080, 96)
     }
 }

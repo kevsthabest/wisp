@@ -28,6 +28,69 @@ pub const SLOT: f32 = 48.0;
 pub const PAD: f32 = 8.0;
 pub const SEPARATOR: f32 = 9.0;
 
+/// Which screen edge the dock is anchored to. All geometry in
+/// this module is computed in *dock space* — `(u, v)` where `u`
+/// runs along the strip from its start and `v` runs from the
+/// anchor edge inward — and only the mapping to window
+/// coordinates knows the edge. Bottom and Top are the identity
+/// mapping in window space (they differ in screen anchoring,
+/// slide direction, and popup side, all handled by the caller);
+/// Left and Right swap the axes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Edge {
+    #[default]
+    Bottom,
+    Top,
+    Left,
+    Right,
+}
+
+impl Edge {
+    pub fn is_vertical(self) -> bool {
+        matches!(self, Edge::Left | Edge::Right)
+    }
+
+    /// Dock space `(u, v)` → window-local `(x, y)`, in DIPs.
+    pub fn to_window(self, u: f32, v: f32) -> (f32, f32) {
+        if self.is_vertical() { (v, u) } else { (u, v) }
+    }
+
+    /// Window-local `(x, y)` → dock space `(u, v)`, in DIPs.
+    /// (The mapping is an involution — swap or identity — so it
+    /// is its own inverse; the name says the direction of the
+    /// conversion, hence the convention allowance.)
+    #[allow(clippy::wrong_self_convention)]
+    pub fn from_window(self, x: f32, y: f32) -> (f32, f32) {
+        self.to_window(x, y)
+    }
+
+    /// The direction the dock slides to hide, as a window-space
+    /// unit vector: away from the screen's interior, off its own
+    /// edge.
+    pub fn hide_dir(self) -> (i32, i32) {
+        match self {
+            Edge::Bottom => (0, 1),
+            Edge::Top => (0, -1),
+            Edge::Left => (-1, 0),
+            Edge::Right => (1, 0),
+        }
+    }
+
+    /// The chevron glyph for the tray flyout toggle, per edge:
+    /// while the flyout is open it points back toward the anchor
+    /// edge (the way it closes); closed, it points inward (the
+    /// way it opens) — the bottom-edge behaviour the dock ships
+    /// today, rotated.
+    pub fn chevron(self, open: bool) -> &'static str {
+        match (self, open) {
+            (Edge::Bottom, true) | (Edge::Top, false) => "\u{E70D}",
+            (Edge::Bottom, false) | (Edge::Top, true) => "\u{E70E}",
+            (Edge::Left, true) | (Edge::Right, false) => "\u{E76B}",
+            (Edge::Left, false) | (Edge::Right, true) => "\u{E76C}",
+        }
+    }
+}
+
 pub fn layout_scale(app_icon_size: f32) -> f32 {
     app_icon_size / DEFAULT_APP_ICON_SIZE
 }
@@ -581,5 +644,76 @@ mod tests {
         assert_eq!(flyout_hit(x + 1.0, y + 1.0, 6), None);
         assert_eq!(flyout_hit(FLYOUT_PAD - 1.0, 10.0, 3), None);
         assert_eq!(flyout_hit(FLYOUT_PAD + 5.0 * FLYOUT_CELL + 1.0, 10.0, 9), None);
+    }
+}
+
+/// Where a popup window goes: centred on its anchor along the
+/// dock's main axis, offset inward from the anchor's inner side
+/// by `gap`, clamped inside `bounds` (the work rect). Rects are
+/// `(left, top, right, bottom)` in screen pixels; returns the
+/// popup's top-left. The window list's capacity is the caller's
+/// problem — this only positions.
+pub fn popup_pos(
+    edge: Edge,
+    anchor: (i32, i32, i32, i32),
+    size: (i32, i32),
+    bounds: (i32, i32, i32, i32),
+    gap: i32,
+) -> (i32, i32) {
+    let (w, h) = size;
+    let centre_x = (anchor.0 + anchor.2) / 2;
+    let centre_y = (anchor.1 + anchor.3) / 2;
+    let clamp = |v: i32, lo: i32, hi: i32| v.clamp(lo, hi.max(lo));
+    match edge {
+        Edge::Bottom => (
+            clamp(centre_x - w / 2, bounds.0, bounds.2 - w),
+            clamp(anchor.1 - gap - h, bounds.1, bounds.3 - h),
+        ),
+        Edge::Top => (
+            clamp(centre_x - w / 2, bounds.0, bounds.2 - w),
+            clamp(anchor.3 + gap, bounds.1, bounds.3 - h),
+        ),
+        Edge::Left => (
+            clamp(anchor.2 + gap, bounds.0, bounds.2 - w),
+            clamp(centre_y - h / 2, bounds.1, bounds.3 - h),
+        ),
+        Edge::Right => (
+            clamp(anchor.0 - gap - w, bounds.0, bounds.2 - w),
+            clamp(centre_y - h / 2, bounds.1, bounds.3 - h),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+
+    #[test]
+    fn window_mapping_round_trips_on_every_edge() {
+        for edge in [Edge::Bottom, Edge::Top, Edge::Left, Edge::Right] {
+            let (x, y) = edge.to_window(30.0, 12.0);
+            assert_eq!(edge.from_window(x, y), (30.0, 12.0), "{edge:?}");
+        }
+        assert_eq!(Edge::Bottom.to_window(30.0, 12.0), (30.0, 12.0));
+        assert_eq!(Edge::Top.to_window(30.0, 12.0), (30.0, 12.0));
+        assert_eq!(Edge::Left.to_window(30.0, 12.0), (12.0, 30.0));
+        assert_eq!(Edge::Right.to_window(30.0, 12.0), (12.0, 30.0));
+    }
+
+    #[test]
+    fn popup_opens_inward_and_clamps_to_bounds() {
+        let bounds = (0, 0, 1920, 1040);
+        // Bottom dock item: popup above it, centred on the item.
+        let anchor = (900, 976, 948, 1040);
+        assert_eq!(popup_pos(Edge::Bottom, anchor, (240, 200), bounds, 8), (804, 768));
+        // Top dock item: popup below it.
+        let anchor = (900, 0, 948, 64);
+        assert_eq!(popup_pos(Edge::Top, anchor, (240, 200), bounds, 8), (804, 72));
+        // Left dock item: popup to its right, centred vertically.
+        let anchor = (0, 400, 74, 448);
+        assert_eq!(popup_pos(Edge::Left, anchor, (240, 200), bounds, 8), (82, 324));
+        // Right dock, item at the screen's top corner: clamped in.
+        let anchor = (1846, 0, 1920, 48);
+        assert_eq!(popup_pos(Edge::Right, anchor, (240, 200), bounds, 8), (1598, 0));
     }
 }

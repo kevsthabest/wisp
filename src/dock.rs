@@ -3,7 +3,7 @@
 #[path = "dock/desktops.rs"]
 mod desktops;
 #[path = "dock/logic.rs"]
-mod logic;
+pub(crate) mod logic;
 #[path = "dock/render.rs"]
 mod render;
 #[path = "dock/space.rs"]
@@ -139,6 +139,14 @@ struct State {
     /// The dock's left edge on screen, in physical pixels.
     left: i32,
     width: i32,
+    /// The window's height on screen, in physical pixels. Width
+    /// and height swap roles on vertical edges, so both are
+    /// stored rather than recomputing one from the layout.
+    win_height: i32,
+    /// Which screen edge the dock is anchored to. Geometry is
+    /// computed in dock space (logic::Edge) and mapped at the
+    /// window boundary; Bottom is the historical behaviour.
+    edge: logic::Edge,
     surface_rect: Option<RECT>,
     /// Hosts the notification area while the taskbar is hidden.
     tray_host: Option<TrayHost>,
@@ -231,6 +239,8 @@ impl Dock {
             desktop_pill: None,
             left: 0,
             width: 0,
+            win_height: 0,
+            edge: logic::Edge::Bottom,
             surface_rect: None,
             tray_host: None,
             tray: Vec::new(),
@@ -439,10 +449,17 @@ impl Dock {
         unsafe {
             let _ = GetWindowRect(self.hwnd, &mut rect);
             if !IsWindowVisible(self.hwnd).as_bool() {
-                let height = rect.bottom - rect.top;
+                // Park the surface just past the anchor edge, in
+                // whichever direction that edge hides toward.
                 let layout_scale = logic::layout_scale(s.app_icon_size);
-                rect.top = s.top + height + (logic::margin(layout_scale) * s.dpi as f32 / 96.0).round() as i32;
-                rect.bottom = rect.top + height;
+                let margin = (logic::margin(layout_scale) * s.dpi as f32 / 96.0).round() as i32;
+                let dir = s.edge.hide_dir();
+                let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+                let cross = if s.edge.is_vertical() { w } else { h };
+                rect.left = s.left + dir.0 * (cross + margin);
+                rect.top = s.top + dir.1 * (cross + margin);
+                rect.right = rect.left + w;
+                rect.bottom = rect.top + h;
             }
             let _ = KillTimer(Some(self.hwnd), POLL_TIMER);
         }
@@ -477,7 +494,7 @@ impl Dock {
             left: s.left,
             top: s.top,
             right: s.left + s.width,
-            bottom: s.top + (logic::height(logic::layout_scale(s.app_icon_size)) * s.dpi as f32 / 96.0).round() as i32,
+            bottom: s.top + s.win_height,
         }
     }
 
@@ -638,8 +655,27 @@ impl Dock {
         !self.state.borrow().autohide
     }
 
-    /// The room a dock that stays visible keeps at the bottom of the primary
-    /// screen, in DIPs: its height and the margins above and below it.
+    /// Moves the dock to another screen edge. Placement,
+    /// popups, and the work-area reservation follow on the next
+    /// sync; bridge mode calls this with Bottom only (edges are
+    /// a standalone-shell capability in this phase).
+    pub fn set_edge(&mut self, edge: logic::Edge) {
+        let mut s = self.state.borrow_mut();
+        if s.edge == edge {
+            return;
+        }
+        s.edge = edge;
+        s.surface_rect = None;
+        s.close_flyout();
+        s.hide_tip();
+        s.hide_windows();
+        s.place();
+    }
+
+    /// The room a dock that stays visible keeps on its screen
+    /// edge, in DIPs: the strip's cross size and the margins on
+    /// both sides of it. (Named for its original bottom-edge
+    /// meaning; the value is the thickness on any edge.)
     pub fn reserved_height(&self) -> f32 {
         let s = self.state.borrow();
         let scale = logic::layout_scale(s.app_icon_size);
@@ -717,10 +753,12 @@ impl State {
             tray,
             inline,
             flyout_open,
+            edge,
             ..
         } = self;
         let frame = &render::Frame {
             dpi: *dpi,
+            edge: *edge,
             palette,
             items,
             icons,
@@ -876,10 +914,18 @@ impl State {
                 }
                 return;
             }
-            // Dragging along the bottom edge, such as a scroll bar, is not a request for the dock.
+            // Dragging along the anchor edge, such as a scroll bar, is not a request for the dock.
             let dragging =
                 unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0 };
-            if !dragging && at_bottom_edge(cursor) && !fullscreen_foreground(self.hwnd) {
+            let mut info = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let on_edge = unsafe {
+                GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &mut info).as_bool()
+                    && at_anchor_edge(cursor, self.edge, &info)
+            };
+            if !dragging && on_edge && !fullscreen_foreground(self.hwnd) {
                 self.reveal();
             }
             return;
@@ -900,7 +946,8 @@ impl State {
             }
         }
         let slack = (12 * self.dpi / 96) as i32;
-        // The gap below the dock counts as on it, so the pointer can rest on the edge.
+        // The gap beyond the dock (between it and its screen edge)
+        // counts as on it, so the pointer can rest on the edge.
         // The dock stays while its flyout is open.
         let mut windows_rect = RECT::default();
         let windows_open = unsafe { IsWindowVisible(self.windows) }.as_bool()
@@ -910,11 +957,22 @@ impl State {
             && cursor.x < windows_rect.right
             && cursor.y >= windows_rect.top
             && cursor.y < windows_rect.bottom;
+        // Slack extends on every side except the anchor side,
+        // where the screen edge itself is the bound.
+        let (sl, st, sr, sb) = match self.edge {
+            logic::Edge::Bottom => (slack, slack, slack, 0),
+            logic::Edge::Top => (slack, 0, slack, slack),
+            logic::Edge::Left => (0, slack, slack, slack),
+            logic::Edge::Right => (slack, slack, 0, slack),
+        };
         let near = !self.autohide
             || self.held
             || self.flyout_open
             || over_windows
-            || cursor.x >= rect.left - slack && cursor.x < rect.right + slack && cursor.y >= rect.top - slack;
+            || cursor.x >= rect.left - sl
+                && cursor.x < rect.right + sr
+                && cursor.y >= rect.top - st
+                && cursor.y < rect.bottom + sb;
         if near {
             self.away = 0;
         } else {
@@ -990,12 +1048,20 @@ impl State {
         let mut rect = RECT::default();
         unsafe {
             let _ = GetWindowRect(self.hwnd, &mut rect);
-            let offset = self.slide_offset(rect.bottom - rect.top);
+            // The slide runs along the anchor edge's axis: the
+            // cross size is the window's extent across the strip.
+            let cross = if self.edge.is_vertical() {
+                rect.right - rect.left
+            } else {
+                rect.bottom - rect.top
+            };
+            let offset = self.slide_offset(cross);
+            let dir = self.edge.hide_dir();
             let _ = SetWindowPos(
                 self.hwnd,
                 None,
-                rect.left,
-                self.top + offset,
+                self.left + dir.0 * offset,
+                self.top + dir.1 * offset,
                 0,
                 0,
                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
@@ -1062,7 +1128,14 @@ impl State {
             if self.autohide {
                 let _ = GetCursorPos(&mut cursor);
             }
-            let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
+            // In a standalone session the shell may name the
+            // monitor the bar lives on; that outranks the pointer.
+            let named = if crate::backend::is_standalone() {
+                crate::coquille::target_monitor().and_then(|name| monitor_by_name(&name))
+            } else {
+                None
+            };
+            let monitor = named.unwrap_or_else(|| MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY));
             let mut info = MONITORINFO {
                 cbSize: size_of::<MONITORINFO>() as u32,
                 ..Default::default()
@@ -1077,7 +1150,7 @@ impl State {
                     self.hwnd,
                     Some(HWND_TOPMOST),
                     info.rcMonitor.left,
-                    info.rcMonitor.bottom - 60,
+                    info.rcMonitor.top,
                     0,
                     0,
                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW,
@@ -1113,23 +1186,64 @@ impl State {
             }
             let parts = self.parts();
             let layout_scale = logic::layout_scale(self.app_icon_size);
-            let available = (info.rcMonitor.right - info.rcMonitor.left) as f32 / scale
-                - 8.0 * layout_scale
-                - logic::status_width_scaled(&parts, layout_scale);
+            // Everything up to the window size is computed in
+            // dock space: the main axis runs along the strip, the
+            // cross axis is its thickness, whichever screen axes
+            // those are for the current edge.
+            let mon_main = if self.edge.is_vertical() {
+                info.rcMonitor.bottom - info.rcMonitor.top
+            } else {
+                info.rcMonitor.right - info.rcMonitor.left
+            };
+            let available =
+                mon_main as f32 / scale - 8.0 * layout_scale - logic::status_width_scaled(&parts, layout_scale);
             self.capacity = (((available - 2.0 * logic::pad(layout_scale) - logic::separator_width(layout_scale))
                 / logic::slot(layout_scale)) as usize)
                 .saturating_sub(1);
             self.scroll = self.scroll.min(self.items.len().saturating_sub(self.capacity));
             let running = self.count();
-            let width = (logic::total_width_scaled(running, &parts, layout_scale) * scale).ceil() as i32;
-            let height = (logic::height(layout_scale) * scale).round() as i32;
-            let x = info.rcMonitor.left + (info.rcMonitor.right - info.rcMonitor.left - width) / 2;
-            self.top = info.rcMonitor.bottom - height - (logic::margin(layout_scale) * scale).round() as i32;
+            let main_px = (logic::total_width_scaled(running, &parts, layout_scale) * scale).ceil() as i32;
+            let cross_px = (logic::height(layout_scale) * scale).round() as i32;
+            let margin_px = (logic::margin(layout_scale) * scale).round() as i32;
+            let (width, height) = if self.edge.is_vertical() {
+                (cross_px, main_px)
+            } else {
+                (main_px, cross_px)
+            };
+            let (x, y_rest) = match self.edge {
+                logic::Edge::Bottom => (
+                    info.rcMonitor.left + (info.rcMonitor.right - info.rcMonitor.left - width) / 2,
+                    info.rcMonitor.bottom - cross_px - margin_px,
+                ),
+                logic::Edge::Top => (
+                    info.rcMonitor.left + (info.rcMonitor.right - info.rcMonitor.left - width) / 2,
+                    info.rcMonitor.top + margin_px,
+                ),
+                logic::Edge::Left => (
+                    info.rcMonitor.left + margin_px,
+                    info.rcMonitor.top + (info.rcMonitor.bottom - info.rcMonitor.top - height) / 2,
+                ),
+                logic::Edge::Right => (
+                    info.rcMonitor.right - cross_px - margin_px,
+                    info.rcMonitor.top + (info.rcMonitor.bottom - info.rcMonitor.top - height) / 2,
+                ),
+            };
             self.left = x;
+            self.top = y_rest;
             self.width = width;
-            let y = self.top + self.slide_offset(height);
+            self.win_height = height;
+            let dir = self.edge.hide_dir();
+            let offset = self.slide_offset(cross_px);
             crate::theme::shape(self.hwnd, width, height, 8.0 * layout_scale, self.dpi);
-            let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), x, y, width, height, SWP_NOACTIVATE);
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                x + dir.0 * offset,
+                y_rest + dir.1 * offset,
+                width,
+                height,
+                SWP_NOACTIVATE,
+            );
         }
         if previous != (self.dpi, self.left, self.top, self.width, self.scroll, self.capacity) {
             self.hide_windows();
@@ -1149,51 +1263,62 @@ impl State {
         self.status.parts(self.tray_host.as_ref().map(|_| self.inline.len()))
     }
 
+    /// Maps a dock-space strip segment (`u_from..u_to`, the full
+    /// cross extent) to a screen RECT where the dock rests, in
+    /// physical pixels — the one place part/item rects learn
+    /// which edge the dock sits on. On the unified surface the
+    /// main axis scales across the surface and the dock hugs the
+    /// surface edge it anchors to (the surface is a horizontal
+    /// mode; vertical edges never share it).
+    fn strip_rect(&self, u_from: f32, u_to: f32) -> RECT {
+        let scale = self.dpi as f32 / 96.0;
+        let px = |dip: f32| (dip * scale).round() as i32;
+        let layout_scale = logic::layout_scale(self.app_icon_size);
+        let cross = logic::height(layout_scale);
+        if let Some(rect) = self.surface_rect
+            && !self.edge.is_vertical()
+        {
+            let x = |dip: f32| {
+                rect.left + (px(dip) as f32 * (rect.right - rect.left) as f32 / self.width.max(1) as f32).round() as i32
+            };
+            let top = match self.edge {
+                logic::Edge::Top => rect.top,
+                _ => rect.bottom - px(cross),
+            };
+            return RECT {
+                left: x(u_from),
+                top,
+                right: x(u_to),
+                bottom: top + px(cross),
+            };
+        }
+        let (ax, ay) = self.edge.to_window(u_from, 0.0);
+        let (bx, by) = self.edge.to_window(u_to, cross);
+        let dir = self.edge.hide_dir();
+        let offset = self.slide_offset(px(cross));
+        let ox = self.left + dir.0 * offset;
+        let oy = self.top + dir.1 * offset;
+        RECT {
+            left: ox + px(ax),
+            top: oy + px(ay),
+            right: ox + px(bx),
+            bottom: oy + px(by),
+        }
+    }
+
     /// A part's rectangle on screen where the dock rests, in physical pixels.
     fn part_rect(&self, part: logic::Part) -> Option<RECT> {
-        let scale = self.dpi as f32 / 96.0;
         let running = self.count();
-        let left = logic::part_left_scaled(part, running, &self.parts(), logic::layout_scale(self.app_icon_size))?;
-        let px = |dip: f32| (dip * scale).round() as i32;
-        let rect = self.surface_rect;
-        let x = |dip| match rect {
-            Some(rect) => {
-                rect.left + (px(dip) as f32 * (rect.right - rect.left) as f32 / self.width.max(1) as f32).round() as i32
-            }
-            None => self.left + px(dip),
-        };
         let layout_scale = logic::layout_scale(self.app_icon_size);
-        let height = logic::height(layout_scale);
-        let top = rect.map_or(self.top + self.slide_offset(px(height)), |r| r.bottom - px(height));
-        Some(RECT {
-            left: x(left),
-            top,
-            right: x(left + part.width_scaled(layout_scale)),
-            bottom: top + px(height),
-        })
+        let left = logic::part_left_scaled(part, running, &self.parts(), layout_scale)?;
+        Some(self.strip_rect(left, left + part.width_scaled(layout_scale)))
     }
 
     /// An app slot's rectangle on screen where the dock rests, in physical pixels.
     fn item_rect(&self, slot: usize) -> RECT {
-        let scale = self.dpi as f32 / 96.0;
-        let px = |dip: f32| (dip * scale).round() as i32;
-        let rect = self.surface_rect;
-        let x = |dip| match rect {
-            Some(rect) => {
-                rect.left + (px(dip) as f32 * (rect.right - rect.left) as f32 / self.width.max(1) as f32).round() as i32
-            }
-            None => self.left + px(dip),
-        };
         let layout_scale = logic::layout_scale(self.app_icon_size);
-        let height = logic::height(layout_scale);
         let left = logic::left_scaled(slot, layout_scale);
-        let top = rect.map_or(self.top + self.slide_offset(px(height)), |r| r.bottom - px(height));
-        RECT {
-            left: x(left),
-            top,
-            right: x(left + logic::slot(layout_scale)),
-            bottom: top + px(height),
-        }
+        self.strip_rect(left, left + logic::slot(layout_scale))
     }
 
     /// A flyout cell's rectangle on screen, in physical pixels.
@@ -1329,10 +1454,19 @@ impl State {
         }
         let margin = (logic::FLYOUT_GAP * scale).round() as i32;
         let monitor = info.rcMonitor;
-        let x = ((chevron.left + chevron.right - width) / 2)
-            .min(monitor.right - margin - width)
-            .max(monitor.left + margin);
-        let y = self.top - margin - height;
+        let bounds = (
+            monitor.left + margin,
+            monitor.top + margin,
+            monitor.right - margin,
+            monitor.bottom - margin,
+        );
+        let (x, y) = logic::popup_pos(
+            self.edge,
+            (chevron.left, chevron.top, chevron.right, chevron.bottom),
+            (width, height),
+            bounds,
+            margin,
+        );
         unsafe {
             let _ = SetWindowPos(self.flyout, Some(HWND_TOPMOST), x, y, width, height, SWP_NOACTIVATE);
             let _ = InvalidateRect(Some(self.flyout), None, false);
@@ -1551,7 +1685,15 @@ impl State {
         }
         let anchor = self.item_rect(slot);
         let gap = (6.0 * scale).round() as i32;
-        let available = anchor.top - gap - (info.rcWork.top + gap);
+        // The rows stack along the screen's vertical; the room
+        // for them is the space inward from the anchor — above a
+        // bottom dock, below a top dock, the full work height
+        // beside a side dock.
+        let available = match self.edge {
+            logic::Edge::Bottom => anchor.top - gap - (info.rcWork.top + gap),
+            logic::Edge::Top => info.rcWork.bottom - gap - (anchor.bottom + gap),
+            logic::Edge::Left | logic::Edge::Right => info.rcWork.bottom - gap - (info.rcWork.top + gap),
+        };
         let capacity = logic::window_list_rows(available, scale, logic::LIST_PAD.1, logic::LIST_CARD_H);
         if capacity == 0 {
             self.hide_windows();
@@ -1571,9 +1713,14 @@ impl State {
             return;
         };
         let (width, height) = ((width * scale).ceil() as i32, (height * scale).ceil() as i32);
-        let x = ((anchor.left + anchor.right - width) / 2)
-            .min(info.rcWork.right - gap - width)
-            .max(info.rcWork.left + gap);
+        let work = info.rcWork;
+        let (x, y) = logic::popup_pos(
+            self.edge,
+            (anchor.left, anchor.top, anchor.right, anchor.bottom),
+            (width, height),
+            (work.left, work.top, work.right, work.bottom),
+            gap,
+        );
         self.hide_tip();
         self.windows_hover = self.windows_hover.filter(|&row| row < targets.len());
         self.windows_rows = rows;
@@ -1583,7 +1730,7 @@ impl State {
                 self.windows,
                 Some(HWND_TOPMOST),
                 x,
-                anchor.top - gap - height,
+                y,
                 width,
                 height,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
@@ -1666,16 +1813,21 @@ impl State {
             let _ = GetMonitorInfoW(MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST), &mut info);
         }
         let gap = (6.0 * scale).round() as i32;
-        let x = ((anchor.left + anchor.right - width) / 2)
-            .min(info.rcMonitor.right - gap - width)
-            .max(info.rcMonitor.left + gap);
+        let mon = info.rcMonitor;
+        let (x, y) = logic::popup_pos(
+            self.edge,
+            (anchor.left, anchor.top, anchor.right, anchor.bottom),
+            (width, height),
+            (mon.left + gap, mon.top + gap, mon.right - gap, mon.bottom - gap),
+            gap,
+        );
         self.tip_text = text;
         unsafe {
             let _ = SetWindowPos(
                 self.tip,
                 Some(HWND_TOPMOST),
                 x,
-                anchor.top - gap - height,
+                y,
                 width,
                 height,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
@@ -1724,27 +1876,26 @@ impl State {
         }
     }
 
-    fn hit(&self, lp: LPARAM) -> Option<usize> {
+    /// The pointer swap point: window DIPs become dock space
+    /// here, between the DPI division and the layout-scale
+    /// division inside the logic functions, so every caller
+    /// (click, hover, wheel) works in dock space unchanged.
+    fn dock_space(&self, lp: LPARAM) -> (f32, f32) {
         let scale = self.dpi as f32 / 96.0;
+        self.edge
+            .from_window((lp.0 as i16) as f32 / scale, ((lp.0 >> 16) as i16) as f32 / scale)
+    }
+
+    fn hit(&self, lp: LPARAM) -> Option<usize> {
         let running = self.count();
-        logic::hit_scaled(
-            (lp.0 as i16) as f32 / scale,
-            ((lp.0 >> 16) as i16) as f32 / scale,
-            running,
-            logic::layout_scale(self.app_icon_size),
-        )
+        let (u, v) = self.dock_space(lp);
+        logic::hit_scaled(u, v, running, logic::layout_scale(self.app_icon_size))
     }
 
     fn hit_part(&self, lp: LPARAM) -> Option<logic::Part> {
-        let scale = self.dpi as f32 / 96.0;
         let running = self.count();
-        logic::part_hit_scaled(
-            (lp.0 as i16) as f32 / scale,
-            ((lp.0 >> 16) as i16) as f32 / scale,
-            running,
-            &self.parts(),
-            logic::layout_scale(self.app_icon_size),
-        )
+        let (u, v) = self.dock_space(lp);
+        logic::part_hit_scaled(u, v, running, &self.parts(), logic::layout_scale(self.app_icon_size))
     }
 
     /// The speaker toggles mute; the clock opens the calendar and notifications;
@@ -1819,11 +1970,24 @@ impl State {
             let _ = KillTimer(Some(self.hwnd), TIP_TIMER);
             let mut dock = RECT::default();
             let _ = GetWindowRect(self.hwnd, &mut dock);
+            let mut info = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let _ = GetMonitorInfoW(MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST), &mut info);
+            let mon = info.rcMonitor;
+            let (x, y) = logic::popup_pos(
+                self.edge,
+                (dock.left, dock.top, dock.right, dock.bottom),
+                (width, height),
+                (mon.left, mon.top, mon.right, mon.bottom),
+                gap,
+            );
             let _ = SetWindowPos(
                 self.tip,
                 Some(HWND_TOPMOST),
-                (dock.left + dock.right - width) / 2,
-                dock.top - gap - height,
+                x,
+                y,
                 width,
                 height,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
@@ -1951,15 +2115,52 @@ fn window_aumid(hwnd: HWND) -> Option<String> {
     }
 }
 
-fn at_bottom_edge(cursor: POINT) -> bool {
-    let mut info = MONITORINFO {
-        cbSize: size_of::<MONITORINFO>() as u32,
-        ..Default::default()
+/// Finds a monitor by its device name (`\\.\DISPLAY2` — the
+/// stable identity the shell's layouts persist against). Used
+/// when the shell names the monitor the bar lives on.
+pub(crate) fn monitor_by_name(name: &str) -> Option<HMONITOR> {
+    struct Search {
+        name: Vec<u16>,
+        found: Option<HMONITOR>,
+    }
+    unsafe extern "system" fn callback(monitor: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> windows::core::BOOL {
+        let search = unsafe { &mut *(data.0 as *mut Search) };
+        let mut info = MONITORINFOEXW {
+            monitorInfo: MONITORINFO {
+                cbSize: size_of::<MONITORINFOEXW>() as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
+            let device: Vec<u16> = info.szDevice.iter().take_while(|&&c| c != 0).copied().collect();
+            if device == search.name {
+                search.found = Some(monitor);
+                return windows::core::BOOL(0);
+            }
+        }
+        windows::core::BOOL(1)
+    }
+    let mut search = Search {
+        name: name.encode_utf16().collect(),
+        found: None,
     };
     unsafe {
-        GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &mut info).as_bool()
-            && cursor.y >= info.rcMonitor.bottom - 2
-            && (info.rcMonitor.left..info.rcMonitor.right).contains(&cursor.x)
+        let _ = EnumDisplayMonitors(None, None, Some(callback), LPARAM(&mut search as *mut Search as isize));
+    }
+    search.found
+}
+
+/// Whether the pointer touches the screen edge the dock is
+/// anchored to, within the dock monitor's span on the other
+/// axis — the autohide reveal probe, per edge.
+fn at_anchor_edge(cursor: POINT, edge: logic::Edge, info: &MONITORINFO) -> bool {
+    let m = &info.rcMonitor;
+    match edge {
+        logic::Edge::Bottom => cursor.y >= m.bottom - 2 && cursor.x >= m.left && cursor.x < m.right,
+        logic::Edge::Top => cursor.y <= m.top + 1 && cursor.x >= m.left && cursor.x < m.right,
+        logic::Edge::Left => cursor.x <= m.left + 1 && cursor.y >= m.top && cursor.y < m.bottom,
+        logic::Edge::Right => cursor.x >= m.right - 2 && cursor.y >= m.top && cursor.y < m.bottom,
     }
 }
 
@@ -2210,8 +2411,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         s.wheel_volume(delta.into());
                         return LRESULT(0);
                     }
-                    // Shift scrolls the apps when more run than fit.
-                    if GetKeyState(VK_SHIFT.0 as i32) >= 0 {
+                    // Which gesture scrolls the apps follows the
+                    // strip's axis: on a horizontal dock it is
+                    // shift+wheel (plain wheel switches desktops);
+                    // on a vertical dock the wheel runs along the
+                    // strip itself, so the two swap.
+                    let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+                    if shift == s.edge.is_vertical() {
                         s.wheel_desktops(delta.into());
                         return LRESULT(0);
                     }

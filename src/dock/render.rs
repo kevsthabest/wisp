@@ -60,6 +60,9 @@ pub struct Renderer {
 
 pub struct Frame<'a> {
     pub dpi: u32,
+    /// Which edge the dock is anchored to; rendering happens in
+    /// dock space and maps through this at each rect.
+    pub edge: logic::Edge,
     pub palette: &'a Palette,
     pub items: &'a [Item],
     pub icons: &'a HashMap<String, Arc<IconPixels>>,
@@ -151,6 +154,15 @@ impl Frame<'_> {
 
     fn snap_rect(&self, left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
         rect(self.snap(left), self.snap(top), self.snap(right), self.snap(bottom))
+    }
+
+    /// A dock-space rect `(u0, v0, u1, v1)` as a window rect:
+    /// the one mapping every strip drawing routes through, so
+    /// the swap for vertical edges lives in exactly one place.
+    fn drect(&self, u0: f32, v0: f32, u1: f32, v1: f32) -> D2D_RECT_F {
+        let (ax, ay) = self.edge.to_window(u0, v0);
+        let (bx, by) = self.edge.to_window(u1, v1);
+        self.snap_rect(ax, ay, bx, by)
     }
 
     /// One physical pixel, in DIPs.
@@ -488,7 +500,7 @@ fn tile(target: &Target, frame: &Frame, left: f32, right: f32, color: &D2D1_COLO
         target.brush.SetColor(color);
         target.rt.FillRoundedRectangle(
             &rounded(
-                frame.snap_rect(
+                frame.drect(
                     left,
                     TILE_TOP * frame.layout_scale,
                     right,
@@ -581,11 +593,10 @@ fn draw_flyout(target: &mut Target, frame: &FlyoutFrame) -> Result<()> {
 
 /// A one-pixel vertical rule at `x`, between the apps and the status.
 fn separator(target: &Target, frame: &Frame, x: f32) {
-    let x = frame.snap(x);
     unsafe {
         target.brush.SetColor(&frame.palette.divider);
         target.rt.FillRectangle(
-            &frame.snap_rect(
+            &frame.drect(
                 x,
                 17.0 * frame.layout_scale,
                 x + frame.hairline(),
@@ -636,12 +647,20 @@ unsafe fn draw(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
             let progress = frame.hover_levels.get(index).copied().unwrap_or(0.0);
             let lift = 2.0 * progress * progress * (3.0 - 2.0 * progress);
             let icon_size = *app_icon_size;
-            let icon_top = ICON_CENTER_Y * frame.layout_scale - icon_size / 2.0 - lift * frame.layout_scale;
-            let icon_rect = frame.snap_rect(
+            // The lift moves the icon away from the anchor edge.
+            // In dock space that is -v where v grows toward the
+            // edge (bottom, right) and +v where it grows away
+            // (top, left) — the inward direction per edge.
+            let lift_sign = match frame.edge {
+                logic::Edge::Bottom | logic::Edge::Right => -1.0,
+                logic::Edge::Top | logic::Edge::Left => 1.0,
+            };
+            let icon_v = ICON_CENTER_Y * frame.layout_scale - icon_size / 2.0 + lift_sign * lift * frame.layout_scale;
+            let icon_rect = frame.drect(
                 x + (slot - icon_size) / 2.0,
-                icon_top,
+                icon_v,
                 x + (slot + icon_size) / 2.0,
-                icon_top + icon_size,
+                icon_v + icon_size,
             );
             let Some(item) = item else {
                 // A quiet search affordance leaves the accent to the running indicator.
@@ -699,7 +718,7 @@ unsafe fn draw(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
                 target.brush.SetColor(if active { &p.accent } else { &p.subtext });
                 target.rt.FillRoundedRectangle(
                     &rounded(
-                        frame.snap_rect(
+                        frame.drect(
                             center - half * frame.layout_scale,
                             INDICATOR_TOP * frame.layout_scale,
                             center + half * frame.layout_scale,
@@ -788,9 +807,10 @@ fn draw_status(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
         match part {
             Part::Chevron => {
                 unsafe { target.brush.SetColor(&p.text) };
-                // Up opens the flyout and down closes it, as on the taskbar.
-                let glyph = if frame.flyout_open { "\u{E70D}" } else { "\u{E70E}" };
-                let area = rect(
+                // The glyph points the way it acts, rotated with
+                // the edge (logic::Edge::chevron).
+                let glyph = frame.edge.chevron(frame.flyout_open);
+                let area = frame.drect(
                     left,
                     TILE_TOP * frame.layout_scale,
                     right,
@@ -802,21 +822,18 @@ fn draw_status(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
             Part::Tray(index) => {
                 if let Some(shown) = frame.inline.get(index).and_then(|&i| frame.tray.get(i)) {
                     let middle = (TILE_TOP + TILE_BOTTOM) / 2.0 * frame.layout_scale;
-                    tray_icon(
-                        target,
-                        frame.dpi,
-                        shown,
-                        left + part.width_scaled(frame.layout_scale) / 2.0,
-                        middle,
-                    )?;
+                    let (cx, cy) = frame
+                        .edge
+                        .to_window(left + part.width_scaled(frame.layout_scale) / 2.0, middle);
+                    tray_icon(target, frame.dpi, shown, cx, cy)?;
                 }
                 continue;
             }
             _ => {}
         }
         let (rt, brush) = (&target.rt, &target.brush);
-        let upper = rect(left, UPPER.0 * frame.layout_scale, right, UPPER.1 * frame.layout_scale);
-        let lower = rect(left, LOWER.0 * frame.layout_scale, right, LOWER.1 * frame.layout_scale);
+        let upper = frame.drect(left, UPPER.0 * frame.layout_scale, right, UPPER.1 * frame.layout_scale);
+        let lower = frame.drect(left, LOWER.0 * frame.layout_scale, right, LOWER.1 * frame.layout_scale);
         unsafe {
             match part {
                 Part::Volume => {

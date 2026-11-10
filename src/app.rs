@@ -602,7 +602,16 @@ impl Launcher {
     /// to match the config.
     fn sync_shell(&mut self) {
         self.sync_taskbar();
-        if self.dock.as_ref().is_some_and(|d| d.shared() != self.bottom()) {
+        // The shell's edge (standalone only): the unified
+        // surface is a bottom-edge construction, so a dock on
+        // any other edge is its own window.
+        let edge = if crate::backend::is_standalone() {
+            crate::coquille::edge()
+        } else {
+            dock::logic::Edge::Bottom
+        };
+        let unified = self.bottom() && edge == dock::logic::Edge::Bottom;
+        if self.dock.as_ref().is_some_and(|d| d.shared() != unified) {
             self.dock = None;
         }
         if !self.config.dock {
@@ -611,7 +620,7 @@ impl Launcher {
             return;
         }
         if self.dock.is_none() {
-            match if self.bottom() {
+            match if unified {
                 Dock::on_surface(self.hwnd)
             } else {
                 Dock::new(self.hwnd)
@@ -637,6 +646,9 @@ impl Launcher {
                 self.taskbar.as_ref().is_some_and(TaskbarHider::is_active)
             };
             dock.set_tray(tray_on);
+            if crate::backend::is_standalone() {
+                dock.set_edge(crate::coquille::edge());
+            }
             dock.set_autohide(self.config.dock_autohide);
             if self.visible {
                 dock.hide()
@@ -834,6 +846,17 @@ impl Launcher {
                 token_palette.unwrap_or_else(|| Palette::new(dark, true)),
                 self.config.backdrop,
             );
+        }
+        // Placement rides the theme event too: a changed edge
+        // re-docks and re-reserves without waiting for a shell
+        // sync (the unified-surface case is rebuilt by the next
+        // sync_shell, which owns dock creation).
+        if crate::backend::is_standalone()
+            && let Some(dock) = &mut self.dock
+            && !dock.shared()
+        {
+            dock.set_edge(crate::coquille::edge());
+            self.sync_reserve();
         }
         self.invalidate();
     }
