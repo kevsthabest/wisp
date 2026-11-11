@@ -3,7 +3,10 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use windows::Win32::Foundation::{E_FAIL, ERROR_CANCELLED, HWND, LPARAM, WPARAM};
-use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize};
+use windows::Win32::System::Com::{
+    CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize,
+};
 use windows::Win32::System::SystemInformation::GetWindowsDirectoryW;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::*;
@@ -33,6 +36,72 @@ pub fn app(id: &str, path: Option<&str>, admin: bool) -> Result<()> {
         CoTaskMemFree(Some(pidl.cast()));
         result
     }
+}
+
+/// The Windows Settings app's AppUserModelID. An `ms-settings:`
+/// link names a page of this app, and the app itself only
+/// activates through the activation manager in a session
+/// without Explorer (see `activate`) — so the app entry and its
+/// links take the same route, the link riding as the activation
+/// argument, which is how the app receives a page.
+pub const SETTINGS_AUMID: &str =
+    "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
+
+/// Whether an AppsFolder id is an AppUserModelID: a package
+/// family name and an app id joined by `!`, the family carrying
+/// its publisher suffix after `_`. Desktop apps in the folder
+/// carry path-like ids instead, and the activation manager
+/// cannot take those — the distinction chooses the launch route.
+pub fn looks_like_aumid(id: &str) -> bool {
+    match id.split_once('!') {
+        Some((family, app)) => !family.is_empty() && family.contains('_') && !app.is_empty(),
+        None => false,
+    }
+}
+
+/// Whether an open target is an `ms-settings:` link (the scheme
+/// is case-insensitive, like every URI scheme). Such a link is
+/// not a document to open — it names a page of the Settings app.
+pub fn is_ms_settings_link(target: &str) -> bool {
+    target
+        .get(.."ms-settings:".len())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("ms-settings:"))
+}
+
+/// Activates a packaged app by AppUserModelID through the
+/// application activation manager, the route that talks to the
+/// AppModel activation service directly. The AppsFolder route
+/// in `app` instead asks the shell namespace to invoke the
+/// item, and in a session without Explorer that invoke class is
+/// not registered: the launch fails in milliseconds with
+/// REGDB_E_CLASSNOTREG ("Class not registered") and the app
+/// never starts — Windows Settings from this launcher in a
+/// standalone session, every time, while Coquille's own
+/// surfaces launch packaged apps (Files) this way in the same
+/// session. The caller owns COM: the launch worker's thread is
+/// apartment-threaded already.
+pub fn activate(id: &str, args: &str) -> Result<()> {
+    let aumid = HSTRING::from(id);
+    let arguments = HSTRING::from(args);
+    unsafe {
+        let manager: IApplicationActivationManager =
+            CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)?;
+        manager.ActivateApplication(PCWSTR(aumid.as_ptr()), PCWSTR(arguments.as_ptr()), AO_NONE)?;
+    }
+    Ok(())
+}
+
+/// The launch worker's route for an app launch. The worker only
+/// runs in a standalone session, where a packaged app must go
+/// through the activation manager (see `activate`); an elevated
+/// launch and a desktop app keep the shell routes they already
+/// work through. Bridge mode never reaches this — it calls
+/// `app` synchronously, exactly as it always has.
+fn app_on_worker(id: &str, path: Option<&str>, admin: bool, args: Option<&str>) -> Result<()> {
+    if !admin && looks_like_aumid(id) {
+        return activate(id, args.unwrap_or(""));
+    }
+    app(id, path, admin)
 }
 
 pub fn open(target: &str) -> Result<()> {
@@ -98,19 +167,24 @@ pub fn settings(welcome: bool) -> Result<()> {
     execute(&settings.to_string_lossy(), welcome.then_some("--welcome"), false)
 }
 
-/// A shell activation the launcher can ask for. Everything here ends
-/// in `ShellExecuteExW`, which returns quickly for a plain file but
-/// can block for as long as it likes when the target is an immersive
-/// app or an `ms-settings:` link: the activation waits on shell
-/// infrastructure (the app resolver, the activation broker) that
-/// Explorer normally keeps warm. The variants carry everything the
-/// call needs so the request can cross to another thread unchanged.
+/// A shell activation the launcher can ask for. These calls can
+/// block for as long as they like: a `ShellExecuteExW` for an
+/// immersive target waits on shell infrastructure (the app
+/// resolver, the activation broker) that Explorer normally keeps
+/// warm. The variants carry everything the call needs so the
+/// request can cross to another thread unchanged.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LaunchRequest {
     App {
         id: String,
         path: Option<String>,
         admin: bool,
+        /// Activation arguments for a packaged app — an
+        /// `ms-settings:` link asking the Settings app for one
+        /// of its pages. Only the activation-manager route
+        /// takes them; the shell routes have nowhere to put
+        /// them.
+        args: Option<String>,
     },
     Open(String),
     Shell {
@@ -123,7 +197,12 @@ pub enum LaunchRequest {
 impl LaunchRequest {
     pub fn run(&self) -> Result<()> {
         match self {
-            LaunchRequest::App { id, path, admin } => app(id, path.as_deref(), *admin),
+            LaunchRequest::App {
+                id,
+                path,
+                admin,
+                args,
+            } => app_on_worker(id, path.as_deref(), *admin, args.as_deref()),
             LaunchRequest::Open(target) => open(target),
             LaunchRequest::Shell { command, admin } => shell(command, *admin),
             LaunchRequest::Reveal(path) => reveal(path),
@@ -135,7 +214,10 @@ impl LaunchRequest {
     /// exact call that stalled.
     pub fn describe(&self) -> String {
         match self {
-            LaunchRequest::App { id, .. } => format!("app {id}"),
+            LaunchRequest::App { id, args, .. } => match args {
+                Some(args) => format!("app {id} {args}"),
+                None => format!("app {id}"),
+            },
             LaunchRequest::Open(target) => format!("open {target}"),
             LaunchRequest::Shell { command, .. } => format!("shell {}", truncated(command, 80)),
             LaunchRequest::Reveal(path) => format!("reveal {path}"),
@@ -158,7 +240,16 @@ impl From<Result<()>> for LaunchOutcome {
         match result {
             Ok(()) => LaunchOutcome::Ok,
             Err(e) if is_cancelled(&e) => LaunchOutcome::Cancelled,
-            Err(e) => LaunchOutcome::Failed(e.message()),
+            // The HRESULT rides with the message: "Class not
+            // registered" alone does not say which call class
+            // failed, and the code is what a diagnosis greps
+            // for — a failure that reaches the log (and the
+            // user's notice) without it is only half reported.
+            Err(e) => LaunchOutcome::Failed(format!(
+                "{} (HRESULT {:#010X})",
+                e.message(),
+                e.code().0 as u32
+            )),
         }
     }
 }
@@ -298,9 +389,20 @@ mod tests {
                 id: "Microsoft.WindowsStore_8wekyb3d8bbwe!App".into(),
                 path: None,
                 admin: false,
+                args: None,
             }
             .describe(),
             "app Microsoft.WindowsStore_8wekyb3d8bbwe!App"
+        );
+        assert_eq!(
+            LaunchRequest::App {
+                id: SETTINGS_AUMID.into(),
+                path: None,
+                admin: false,
+                args: Some("ms-settings:personalization-background".into()),
+            }
+            .describe(),
+            format!("app {SETTINGS_AUMID} ms-settings:personalization-background")
         );
         assert_eq!(
             LaunchRequest::Reveal(r"C:\Users\me\file.txt".into()).describe(),
@@ -323,8 +425,37 @@ mod tests {
         assert_eq!(LaunchOutcome::from(Ok(())), LaunchOutcome::Ok);
         let cancelled = windows::core::Error::new(ERROR_CANCELLED.to_hresult(), "no".to_string());
         assert_eq!(LaunchOutcome::from(Err(cancelled)), LaunchOutcome::Cancelled);
+        // The failure carries its HRESULT beside the message —
+        // the code is what a diagnosis greps for.
         let failed = windows::core::Error::new(E_FAIL, "boom".to_string());
-        assert_eq!(LaunchOutcome::from(Err(failed)), LaunchOutcome::Failed("boom".into()));
+        assert_eq!(
+            LaunchOutcome::from(Err(failed)),
+            LaunchOutcome::Failed("boom (HRESULT 0x80004005)".into())
+        );
+    }
+
+    #[test]
+    fn aumid_shape_decides_the_activation_route() {
+        // Packaged apps: family (with publisher suffix) ! app id.
+        assert!(looks_like_aumid(SETTINGS_AUMID));
+        assert!(looks_like_aumid("Microsoft.WindowsStore_8wekyb3d8bbwe!App"));
+        // Desktop apps in the AppsFolder carry path-like ids the
+        // activation manager cannot take.
+        assert!(!looks_like_aumid(r"C:\Program Files\Vendor\app.exe"));
+        assert!(!looks_like_aumid("Microsoft.AutoGenerated.{3B6E7A1F-9C2D}"));
+        assert!(!looks_like_aumid("FamilyWithoutSuffix!App"));
+        assert!(!looks_like_aumid("!App"));
+        assert!(!looks_like_aumid("family_hash!"));
+    }
+
+    #[test]
+    fn ms_settings_links_are_recognised_case_insensitively() {
+        assert!(is_ms_settings_link("ms-settings:personalization-background"));
+        assert!(is_ms_settings_link("MS-Settings:display"));
+        assert!(is_ms_settings_link("ms-settings:"));
+        assert!(!is_ms_settings_link("ms-settings"));
+        assert!(!is_ms_settings_link("https://example.com"));
+        assert!(!is_ms_settings_link("ms-set"));
     }
 
     /// The hang fix's seam: dispatch is a channel send, so a runner

@@ -577,7 +577,22 @@ fn launch_request(action: &Action, admin: bool) -> Option<launch::LaunchRequest>
             id: id.clone(),
             path: path.clone(),
             admin: admin || *as_admin,
+            args: None,
         }),
+        // An ms-settings: link is a Settings page, not a
+        // document: it becomes an activation of the Settings
+        // app with the link as its argument, the one route
+        // that reaches the app in a standalone session (the
+        // shell's URI handling is Explorer-registered plumbing;
+        // launch::activate carries the reasoning).
+        Action::Open(target) if launch::is_ms_settings_link(target) => {
+            Some(launch::LaunchRequest::App {
+                id: launch::SETTINGS_AUMID.into(),
+                path: None,
+                admin: false,
+                args: Some(target.clone()),
+            })
+        }
         Action::Open(target) => Some(launch::LaunchRequest::Open(target.clone())),
         Action::Shell {
             command,
@@ -2905,9 +2920,21 @@ mod tests {
 
     #[test]
     fn shell_bound_actions_become_launch_requests() {
+        // An ms-settings: link rides as a Settings activation —
+        // the shell-open route cannot reach the app without
+        // Explorer (launch::activate carries the reasoning).
         assert_eq!(
             launch_request(&Action::Open("ms-settings:personalization-background".into()), false,),
-            Some(LaunchRequest::Open("ms-settings:personalization-background".into()))
+            Some(LaunchRequest::App {
+                id: crate::launch::SETTINGS_AUMID.into(),
+                path: None,
+                admin: false,
+                args: Some("ms-settings:personalization-background".into()),
+            })
+        );
+        assert_eq!(
+            launch_request(&Action::Open("https://example.com".into()), false),
+            Some(LaunchRequest::Open("https://example.com".into()))
         );
         // The caller's admin flag and the action's own combine.
         assert_eq!(
@@ -2923,6 +2950,7 @@ mod tests {
                 id: "app".into(),
                 path: None,
                 admin: true,
+                args: None,
             })
         );
         assert_eq!(
